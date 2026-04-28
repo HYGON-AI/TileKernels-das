@@ -86,7 +86,7 @@ def _mhc_pre_norm_fn_fwd_mul(
             sqrsum_part = T.alloc_fragment((token_block, 4), T.float32)
             T.clear(out_frag)
             T.clear(sqrsum_part)
-            for pz in T.Pipelined(rms_group_size // hidden_block, num_stages=2):
+            for pz in T.Pipelined(rms_group_size // hidden_block, num_stages=0):
                 x_smem_16 = T.alloc_shared((token_block, hidden_block), T.bfloat16)
                 fn_smem = T.alloc_shared((32, hidden_block), T.float32)
 
@@ -100,9 +100,9 @@ def _mhc_pre_norm_fn_fwd_mul(
                 x_frag = T.alloc_fragment((token_block, hidden_block), T.float32)
                 T.copy(x_frag_16, x_frag)
 
-                for jj in T.serial(hidden_block // 4):
-                    for i, j in T.Parallel(token_block, 4):
-                        sqrsum_part[i, j] += x_frag[i, jj * 4 + j] * x_frag[i, jj * 4 + j]
+                for jj in T.serial(hidden_block // 8):
+                    for i, j in T.Parallel(token_block, 8):
+                        sqrsum_part[i, j] += x_frag[i, jj * 8 + j] * x_frag[i, jj * 8 + j]
 
                 T.gemm(
                     x_frag,
