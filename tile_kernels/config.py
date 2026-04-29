@@ -26,4 +26,16 @@ def get_num_sms() -> int:
 @functools.lru_cache(maxsize=None)
 def get_max_smem_per_sm() -> int:
     prop = torch.cuda.get_device_properties(torch.cuda.current_device())
-    return prop.shared_memory_per_multiprocessor
+    if hasattr(prop, 'shared_memory_per_multiprocessor'):
+        return prop.shared_memory_per_multiprocessor
+
+    gcn_arch_name = getattr(prop, 'gcnArchName', None)
+    gcn_arch_base = gcn_arch_name.split(':', 1)[0] if isinstance(gcn_arch_name, str) else None
+    if gcn_arch_base in {'gfx936', 'gfx938'}:
+        return 64 * 1024
+
+    raise AttributeError(
+        'Unable to determine max shared memory per SM: missing '
+        f"'shared_memory_per_multiprocessor' and unsupported "
+        f"gcnArchName={gcn_arch_name!r} (base={gcn_arch_base!r})"
+    )

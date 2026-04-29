@@ -1,7 +1,13 @@
 import torch
 
 from tile_kernels.mhc.norm_fn_kernel import _mhc_pre_norm_fn_fwd_mul, round_to_tf32
+from tile_kernels.mhc.pre_norm_fn_splitk_kernel import _mhc_pre_norm_fn_fwd_mul_splitk
 from tile_kernels.mhc.pre_big_fuse_kernel import _mhc_pre_big_fuse
+
+# Global guards for validating split-k stage0/stage1 kernels.
+MHC_PRE_BIG_FUSE_ENABLE_SMALL_TOKEN_SPLITK = True
+MHC_PRE_BIG_FUSE_SMALL_TOKEN_THRESHOLD = 2048
+MHC_PRE_BIG_FUSE_N_SPLITS_PRE = 32
 
 
 def mhc_pre_big_fuse(
@@ -42,26 +48,68 @@ def mhc_pre_big_fuse(
     comb_mix = torch.empty(num_tokens, mhc_mult2, dtype=torch.float32, device=residual.device)
     layer_input = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device)
 
-    gemm_out_mul = torch.empty(
-        n_splits, num_tokens, mhc_mult3, dtype=torch.float32, device=residual.device
-    )
-    gemm_out_sqrsum = torch.empty(n_splits, num_tokens, dtype=torch.float32, device=residual.device)
-
-    # TileLang implementation doesn't support split-k, so we set n_splits to 1
-    # You may want to adopt the DeepGEMM implementation with split-k for better performance
-    n_splits = 1
-    gemm_out_mul = gemm_out_mul[:1]
-    gemm_out_sqrsum = gemm_out_sqrsum[:1]
-
     fn = round_to_tf32(fn)
-
-    fwd_mul_kernel = _mhc_pre_norm_fn_fwd_mul(mhc_mult3, 1, mhc_hidden_size)
-    fwd_mul_kernel(
-        residual_flat.view(-1, mhc_hidden_size),
-        fn,
-        gemm_out_mul.view(-1, 1, mhc_mult3),
-        gemm_out_sqrsum.view(-1, 1),
+    use_small_token_splitk = (
+        MHC_PRE_BIG_FUSE_ENABLE_SMALL_TOKEN_SPLITK
+        and num_tokens <= MHC_PRE_BIG_FUSE_SMALL_TOKEN_THRESHOLD
+        and MHC_PRE_BIG_FUSE_N_SPLITS_PRE > 1
+        and mhc_hidden_size % MHC_PRE_BIG_FUSE_N_SPLITS_PRE == 0
     )
+    
+    if use_small_token_splitk:
+        if mhc_hidden_size == 16384:
+            hidden_block = 256
+        elif mhc_hidden_size == 28672:
+            hidden_block = 128
+        else:
+            raise NotImplementedError(
+                f"small-token splitk only supports mhc_hidden_size in {{16384, 28672}}, "
+                f"got {mhc_hidden_size}"
+            )
+
+        kernel_0, kernel_1 = _mhc_pre_norm_fn_fwd_mul_splitk(
+            mhc_mult3,
+            mhc_hidden_size,
+            split_k=MHC_PRE_BIG_FUSE_N_SPLITS_PRE,
+            token_block=32,
+            hidden_block=hidden_block,
+        )
+        partial_out = torch.empty(
+            MHC_PRE_BIG_FUSE_N_SPLITS_PRE, num_tokens, 32, dtype=torch.float32, device=residual.device
+        )
+        partial_sqrsum = torch.empty(
+            MHC_PRE_BIG_FUSE_N_SPLITS_PRE, num_tokens, dtype=torch.float32, device=residual.device
+        )
+        gemm_out_mul = torch.empty(
+            1, num_tokens, mhc_mult3, dtype=torch.float32, device=residual.device
+        )
+        gemm_out_sqrsum = torch.empty(1, num_tokens, dtype=torch.float32, device=residual.device)
+        kernel_0(
+            residual_flat.view(-1, mhc_hidden_size),
+            fn,
+            partial_out,
+            partial_sqrsum,
+        )
+        kernel_1(
+            partial_out,
+            partial_sqrsum,
+            gemm_out_mul.squeeze(0),
+            gemm_out_sqrsum.squeeze(0),
+        )
+        n_splits = 1
+    else:
+        gemm_out_mul = torch.empty(
+            1, num_tokens, mhc_mult3, dtype=torch.float32, device=residual.device
+        )
+        gemm_out_sqrsum = torch.empty(1, num_tokens, dtype=torch.float32, device=residual.device)
+        n_splits = 1
+        fwd_mul_kernel = _mhc_pre_norm_fn_fwd_mul(mhc_mult3, 1, mhc_hidden_size)
+        fwd_mul_kernel(
+            residual_flat.view(-1, mhc_hidden_size),
+            fn,
+            gemm_out_mul.view(-1, 1, mhc_mult3),
+            gemm_out_sqrsum.view(-1, 1),
+        )
     # END of TileLang implementation of pre-norm-fn forward matmul
 
     _mhc_pre_big_fuse(

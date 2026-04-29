@@ -133,6 +133,25 @@ def test_correctness(
         test_data['n_splits'],
     )
 
-    assert torch.equal(post_mix_fused, post_mix_ref)
-    assert torch.equal(comb_mix_fused, comb_mix_ref)
-    assert torch.equal(layer_input_fused, layer_input_ref)
+    def _print_tensor_debug(name: str, fused: torch.Tensor, ref: torch.Tensor) -> None:
+        fused_nan = torch.isnan(fused).any().item()
+        ref_nan = torch.isnan(ref).any().item()
+        print(f"[debug] {name}: fused_nan={fused_nan}, ref_nan={ref_nan}, shape={tuple(fused.shape)}")
+        if fused_nan:
+            first = torch.isnan(fused).nonzero()[0].tolist()
+            print(f"[debug] {name}: first_fused_nan_idx={first}")
+        if fused.shape == ref.shape and fused.dtype.is_floating_point:
+            diff_mask = fused != ref
+            if diff_mask.any().item():
+                first = diff_mask.nonzero()[0].tolist()
+                fval = fused[tuple(first)].item()
+                rval = ref[tuple(first)].item()
+                print(f"[debug] {name}: first_mismatch_idx={first}, fused={fval}, ref={rval}")
+
+    _print_tensor_debug("post_mix", post_mix_fused, post_mix_ref)
+    _print_tensor_debug("comb_mix", comb_mix_fused, comb_mix_ref)
+    _print_tensor_debug("layer_input", layer_input_fused, layer_input_ref)
+
+    assert torch.allclose(post_mix_fused, post_mix_ref, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(comb_mix_fused, comb_mix_ref, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(layer_input_fused, layer_input_ref, rtol=1e-2, atol=2e-3)
