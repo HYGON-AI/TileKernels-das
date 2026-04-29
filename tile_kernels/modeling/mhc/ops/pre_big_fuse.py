@@ -53,12 +53,13 @@ def mhc_pre_big_fuse(
         MHC_PRE_BIG_FUSE_ENABLE_SMALL_TOKEN_SPLITK
         and num_tokens <= MHC_PRE_BIG_FUSE_SMALL_TOKEN_THRESHOLD
         and MHC_PRE_BIG_FUSE_N_SPLITS_PRE > 1
+        and mhc_hidden_size in {16384, 28672}
         and mhc_hidden_size % MHC_PRE_BIG_FUSE_N_SPLITS_PRE == 0
     )
     
     if use_small_token_splitk:
         if mhc_hidden_size == 16384:
-            hidden_block = 256
+            hidden_block = 128
         elif mhc_hidden_size == 28672:
             hidden_block = 128
         else:

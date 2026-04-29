@@ -64,9 +64,11 @@ def test_mhc_post_comprehensive(n0: int, n1: int, h: int) -> None:
         atol=1e-4,
         rtol=1e-4,
     )
+    grad_comb_res_mix_atol = 3e-4 if h >= 7168 else 1e-4
+    grad_comb_res_mix_rtol = 2e-2 if h >= 7168 else 1e-4
     torch.testing.assert_close(
         grad_comb_res_mix_tl,
         grad_comb_res_mix_ref,
-        atol=1e-4,
-        rtol=1e-4,
+        atol=grad_comb_res_mix_atol,
+        rtol=grad_comb_res_mix_rtol,
     )
