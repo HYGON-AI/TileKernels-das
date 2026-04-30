@@ -1,4 +1,5 @@
 from .expand import expand_to_mhc
+from .hc_split_sinkhorn import hc_split_sinkhorn
 from .head_compute_mix import mhc_head_compute_mix
 from .multilayer_recompute import mhc_multilayer_recompute
 from .norm_fn import mhc_pre_norm_fn
