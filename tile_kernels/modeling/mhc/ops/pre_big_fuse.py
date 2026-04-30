@@ -1,7 +1,7 @@
 import torch
 
 from tile_kernels.mhc.norm_fn_kernel import _mhc_pre_norm_fn_fwd_mul, round_to_tf32
-from tile_kernels.mhc.pre_norm_fn_splitk_kernel import _mhc_pre_norm_fn_fwd_mul_splitk
+from tile_kernels.mhc.pre_norm_fn_splitk_kernel import mhc_pre_gemm_sqrsum_splitk_kernel
 from tile_kernels.mhc.pre_big_fuse_kernel import _mhc_pre_big_fuse
 
 # Global guards for validating split-k stage0/stage1 kernels.
@@ -68,7 +68,7 @@ def mhc_pre_big_fuse(
                 f"got {mhc_hidden_size}"
             )
 
-        kernel_0, kernel_1 = _mhc_pre_norm_fn_fwd_mul_splitk(
+        kernel_0, kernel_1 = mhc_pre_gemm_sqrsum_splitk_kernel(
             mhc_mult3,
             mhc_hidden_size,
             split_k=MHC_PRE_BIG_FUSE_N_SPLITS_PRE,

@@ -6,7 +6,7 @@ from tilelang import language as T
 
 
 @functools.cache
-def _mhc_pre_norm_fn_fwd_mul_splitk(
+def mhc_pre_gemm_sqrsum_splitk_kernel(
     mhc_mult3: int,
     mhc_hidden_size: int,
     split_k: int,
@@ -23,7 +23,7 @@ def _mhc_pre_norm_fn_fwd_mul_splitk(
     num_tokens = T.dynamic("num_tokens")
 
     @tilelang.jit
-    def _mhc_pre_norm_fn_fwd_mul_splitk_stage_0(
+    def mhc_pre_gemm_sqrsum_splitk_stage_0(
         x: T.Tensor[(num_tokens, mhc_hidden_size), T.bfloat16],
         fn: T.Tensor[(mhc_mult3, mhc_hidden_size), T.float32],
         out_partial: T.Tensor[(split_k, num_tokens, 32), T.float32],
@@ -83,7 +83,7 @@ def _mhc_pre_norm_fn_fwd_mul_splitk(
                     out_partial[bz, t, j] = out_frag[i, j]
 
     @tilelang.jit
-    def _mhc_pre_norm_fn_fwd_mul_splitk_stage_1(
+    def mhc_pre_gemm_sqrsum_splitk_stage_1(
         out_partial: T.Tensor[(split_k, num_tokens, 32), T.float32],
         sqrsum_partial: T.Tensor[(split_k, num_tokens), T.float32],
         out: T.Tensor[(num_tokens, mhc_mult3), T.float32],
@@ -112,7 +112,7 @@ def _mhc_pre_norm_fn_fwd_mul_splitk(
                     out[t, lane] = acc[0]
 
     return (
-        _mhc_pre_norm_fn_fwd_mul_splitk_stage_0,
-        _mhc_pre_norm_fn_fwd_mul_splitk_stage_1,
+        mhc_pre_gemm_sqrsum_splitk_stage_0,
+        mhc_pre_gemm_sqrsum_splitk_stage_1,
     )
 
