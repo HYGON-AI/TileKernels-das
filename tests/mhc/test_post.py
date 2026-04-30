@@ -42,6 +42,19 @@ def _tester(
     return out_, x_.grad, residual_.grad, post_layer_mix_.grad, comb_res_mix_.grad
 
 
+def _estimate_io_bytes(n0: int, n1: int, h: int, mhc_mult: int) -> int:
+    n = n0 * n1
+    read_bytes = (
+        n * h * 2
+        + n * mhc_mult * h * 2
+        + n * mhc_mult * 4
+        + n * mhc_mult * mhc_mult * 4
+        + n * mhc_mult * h * 2
+    )
+    write_bytes = n * mhc_mult * h * 2 + n * h * 2 + n * mhc_mult * h * 2 + n * mhc_mult * 4 + n * mhc_mult * mhc_mult * 4
+    return read_bytes + write_bytes
+
+
 @pytest.mark.parametrize('n0', [1, 2])
 @pytest.mark.parametrize('n1', [4096])
 @pytest.mark.parametrize('h', [1280, 2560, 7168])
@@ -71,4 +84,43 @@ def test_mhc_post_comprehensive(n0: int, n1: int, h: int) -> None:
         grad_comb_res_mix_ref,
         atol=grad_comb_res_mix_atol,
         rtol=grad_comb_res_mix_rtol,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA is required')
+@pytest.mark.benchmark
+@pytest.mark.parametrize(
+    'n0,n1,h,mhc_mult',
+    [
+        (1, 4096, 1280, 4),
+        (1, 4096, 2560, 4),
+        (1, 4096, 7168, 4),
+        (2, 4096, 2560, 4),
+    ],
+)
+def test_mhc_post_benchmark(
+    n0: int,
+    n1: int,
+    h: int,
+    mhc_mult: int,
+    benchmark_timer,
+    benchmark_record,
+) -> None:
+    test_data = generate_mhc_post_test_data(n0=n0, n1=n1, h=h, mhc_mult=mhc_mult)
+
+    def fn_tl() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return _tester(mhc_post, test_data)
+
+    fn_tl()
+    t_tl_us = benchmark_timer(fn_tl)
+    io_bytes = _estimate_io_bytes(n0, n1, h, mhc_mult)
+    bw_tl_gbs = io_bytes / t_tl_us / 1e3
+
+    benchmark_record(
+        kernel='mhc_post',
+        operation='fwd_bwd',
+        params={'n0': n0, 'n1': n1, 'h': h, 'mhc_mult': mhc_mult},
+        time_us=t_tl_us,
+        bandwidth_gbs=bw_tl_gbs,
+        extras={'num_tokens': n0 * n1, 'io_bytes': io_bytes},
     )
