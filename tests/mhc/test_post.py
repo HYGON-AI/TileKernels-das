@@ -42,16 +42,28 @@ def _tester(
     return out_, x_.grad, residual_.grad, post_layer_mix_.grad, comb_res_mix_.grad
 
 
-def _estimate_io_bytes(n0: int, n1: int, h: int, mhc_mult: int) -> int:
+def _estimate_fwd_io_bytes(n0: int, n1: int, h: int, mhc_mult: int) -> int:
     n = n0 * n1
     read_bytes = (
         n * h * 2
         + n * mhc_mult * h * 2
         + n * mhc_mult * 4
         + n * mhc_mult * mhc_mult * 4
-        + n * mhc_mult * h * 2
     )
-    write_bytes = n * mhc_mult * h * 2 + n * h * 2 + n * mhc_mult * h * 2 + n * mhc_mult * 4 + n * mhc_mult * mhc_mult * 4
+    write_bytes = n * mhc_mult * h * 2
+    return read_bytes + write_bytes
+
+
+def _estimate_bwd_io_bytes(n0: int, n1: int, h: int, mhc_mult: int) -> int:
+    n = n0 * n1
+    read_bytes = (
+        n * mhc_mult * h * 2
+        + n * h * 2
+        + n * mhc_mult * h * 2
+        + n * mhc_mult * 4
+        + n * mhc_mult * mhc_mult * 4
+    )
+    write_bytes = n * h * 2 + n * mhc_mult * h * 2 + n * mhc_mult * 4 + n * mhc_mult * mhc_mult * 4
     return read_bytes + write_bytes
 
 
@@ -98,7 +110,7 @@ def test_mhc_post_comprehensive(n0: int, n1: int, h: int) -> None:
         (2, 4096, 2560, 4),
     ],
 )
-def test_mhc_post_benchmark(
+def test_mhc_post_fwd_benchmark(
     n0: int,
     n1: int,
     h: int,
@@ -107,18 +119,71 @@ def test_mhc_post_benchmark(
     benchmark_record,
 ) -> None:
     test_data = generate_mhc_post_test_data(n0=n0, n1=n1, h=h, mhc_mult=mhc_mult)
+    x = test_data['x']
+    residual = test_data['residual']
+    post_layer_mix = test_data['post_layer_mix']
+    comb_res_mix = test_data['comb_res_mix']
 
-    def fn_tl() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return _tester(mhc_post, test_data)
+    def fn_fwd() -> torch.Tensor:
+        return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
-    fn_tl()
-    t_tl_us = benchmark_timer(fn_tl)
-    io_bytes = _estimate_io_bytes(n0, n1, h, mhc_mult)
+    fn_fwd()
+    t_tl_us = benchmark_timer(fn_fwd)
+    io_bytes = _estimate_fwd_io_bytes(n0, n1, h, mhc_mult)
     bw_tl_gbs = io_bytes / t_tl_us / 1e3
 
     benchmark_record(
         kernel='mhc_post',
-        operation='fwd_bwd',
+        operation='fwd',
+        params={'n0': n0, 'n1': n1, 'h': h, 'mhc_mult': mhc_mult},
+        time_us=t_tl_us,
+        bandwidth_gbs=bw_tl_gbs,
+        extras={'num_tokens': n0 * n1, 'io_bytes': io_bytes},
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA is required')
+@pytest.mark.benchmark
+@pytest.mark.parametrize(
+    'n0,n1,h,mhc_mult',
+    [
+        (1, 4096, 1280, 4),
+        (1, 4096, 2560, 4),
+        (1, 4096, 7168, 4),
+        (2, 4096, 2560, 4),
+    ],
+)
+def test_mhc_post_bwd_benchmark(
+    n0: int,
+    n1: int,
+    h: int,
+    mhc_mult: int,
+    benchmark_timer,
+    benchmark_record,
+) -> None:
+    test_data = generate_mhc_post_test_data(n0=n0, n1=n1, h=h, mhc_mult=mhc_mult)
+    x = test_data['x'].clone().requires_grad_()
+    residual = test_data['residual'].clone().requires_grad_()
+    post_layer_mix = test_data['post_layer_mix'].clone().requires_grad_()
+    comb_res_mix = test_data['comb_res_mix'].clone().requires_grad_()
+    out = mhc_post(x, residual, post_layer_mix, comb_res_mix)
+    o_grad = test_data['o_grad']
+
+    def fn_bwd() -> None:
+        x.grad = None
+        residual.grad = None
+        post_layer_mix.grad = None
+        comb_res_mix.grad = None
+        torch.autograd.backward([out], [o_grad], retain_graph=True)
+
+    fn_bwd()
+    t_tl_us = benchmark_timer(fn_bwd)
+    io_bytes = _estimate_bwd_io_bytes(n0, n1, h, mhc_mult)
+    bw_tl_gbs = io_bytes / t_tl_us / 1e3
+
+    benchmark_record(
+        kernel='mhc_post',
+        operation='bwd',
         params={'n0': n0, 'n1': n1, 'h': h, 'mhc_mult': mhc_mult},
         time_us=t_tl_us,
         bandwidth_gbs=bw_tl_gbs,
