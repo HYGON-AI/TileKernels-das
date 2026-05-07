@@ -23,6 +23,7 @@ import statistics
 
 import torch
 from torch.profiler import ProfilerActivity, profile
+from tilelang.profiler import do_bench_cudagraph
 
 from tile_kernels.modeling.mhc.ops import mhc_pre_big_fuse
 
@@ -74,16 +75,16 @@ def generate_big_fuse_test_data(
 
 # Profiler key 中常见的 TileLang 内核名子串（顺序：先匹配更具体的 split-k，再 GEMM，最后融合大核）
 DEFAULT_TILELANG_KERNEL_SUBSTRS: tuple[str, ...] = (
-    "_mhc_pre_norm_fn_fwd_mul_splitk_stage_0",
-    "_mhc_pre_norm_fn_fwd_mul_splitk_stage_1",
+    "mhc_pre_gemm_sqrsum_splitk_stage_0",
+    "mhc_pre_gemm_sqrsum_splitk_stage_1",
     "_mhc_pre_norm_fn_fwd_mul_kernel",
     "mhc_pre_big_fuse",
 )
 
 # 与 pre_big_fuse.py / tile_kernels/mhc 中 prim_func 命名一致；首匹配分桶
 PROFILER_BUCKETS: tuple[tuple[str, str], ...] = (
-    ("fwd_mul_splitk_s0", "_mhc_pre_norm_fn_fwd_mul_splitk_stage_0"),
-    ("fwd_mul_splitk_s1", "_mhc_pre_norm_fn_fwd_mul_splitk_stage_1"),
+    ("fwd_mul_splitk_s0", "mhc_pre_gemm_sqrsum_splitk_stage_0"),
+    ("fwd_mul_splitk_s1", "mhc_pre_gemm_sqrsum_splitk_stage_1"),
     ("fwd_mul_gemm", "_mhc_pre_norm_fn_fwd_mul_kernel"),
     ("big_fuse", "mhc_pre_big_fuse"),
 )
@@ -276,12 +277,12 @@ def benchmark_one_shape(
             n_splits=td["n_splits"],
         )
 
-    evt_label = "CUDA graph replay"
+    evt_label = "CUDA graph replay (tilelang do_bench_cudagraph, mean)"
     if use_cuda_graph:
         try:
-            evt_mean, evt_min, evt_max = cuda_timer_cudagraph(
-                fwd_fn, warmup=warmup, repeat=repeat, device=device
-            )
+            with torch.cuda.device(device):
+                evt_mean = float(do_bench_cudagraph(fwd_fn))
+            evt_min = evt_max = evt_mean
         except RuntimeError as e:
             print(f"    [warn] CUDAGraph 捕获失败，回退 eager Events: {e}")
             evt_mean, evt_min, evt_max = cuda_timer_eager(
@@ -413,9 +414,7 @@ def main() -> None:
             use_cuda_graph=use_cuda_graph,
         )
     else:
-        # n1_list = [512, 1024, 2048, 8192]
-        # hidden_list = [1280, 2560, 4096]
-        n1_list = [2048, 4096, 6912, 8192]
+        n1_list = [1, 16, 32, 64, 128, 256, 512, 2048, 4096, 6912, 8192]
         hidden_list = [4096, 7168]
         for n1 in n1_list:
             for hs in hidden_list:
