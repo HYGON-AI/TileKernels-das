@@ -205,6 +205,10 @@ def per_token_cast_impl(
             device=x.device,
         )
     )
+    if x_sf is None:
+        # TileLang JIT adapter does not accept None tensor arguments.
+        # Keep symbolic dimensions consistent with x_sf_shape in PrimFunc.
+        x_sf = torch.empty((num_tokens, hidden), dtype=torch.float32, device=x.device)
     if num_tokens > 0:
         kernel(x, x_sf, out, out_sf)
 
