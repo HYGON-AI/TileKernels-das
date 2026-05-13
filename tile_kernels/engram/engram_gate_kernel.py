@@ -199,22 +199,26 @@ def get_engram_gate_bwd_kernel(
     clamp_value: float = 1e-6,
     hc_mult: int = 4,
 ):
-    """Backward kernel: 8 warps per CTA, 2 warps per head.
+    """Backward kernel.
 
     grad_out and v cached in shared memory. grad_w accumulates in registers.
     Cross-warp dldg reduction via shared memory.
     """
     assert hc_mult == 4
     num_tokens = T.dynamic('num_tokens')
-    warp_size = 32
-    warps_per_head = 2
+    # Keep logical warp size aligned with backend implementation:
+    # CUDA warp=32, HCU wavefront=64.
+    warp_size = 64 if torch.version.hip is not None else 32
+    # CUDA uses 2 warps/head (2 * 32 = 64 threads/head).
+    # HIP uses 1 wavefront/head (1 * 64 = 64 threads/head), which keeps
+    # per-head parallelism while avoiding excessive shared-memory usage.
+    warps_per_head = 1 if torch.version.hip is not None else 2
     num_warps = hc_mult * warps_per_head
     threads = warp_size * num_warps
     threads_per_head = warp_size * warps_per_head
     assert hidden_size % threads == 0
     elems_per_thread = hidden_size // threads
     elems_per_warp_pair = hidden_size // threads_per_head
-    go_vec_size = 8
     x_vec_size = 4
 
     # NOTE Performance only tuned for hidden_size in {4096, 7168}
@@ -231,6 +235,13 @@ def get_engram_gate_bwd_kernel(
                 result = blk
         return result
 
+    def _choose_go_vec_size(hidden_size, threads_per_head):
+        for vec in [8, 4, 2, 1]:
+            go_tile = threads_per_head * vec
+            if hidden_size % go_tile == 0:
+                return vec
+        raise ValueError(f'No valid go_vec_size for hidden_size={hidden_size}, threads_per_head={threads_per_head}')
+
     def _choose_x_blk_d(hidden_size, x_tile, hc_mult, warps_per_head):
         """Largest multiple of x_tile that divides hidden_size, <= hidden_size // 2, fits in smem."""
         smem_fixed = (hc_mult + 1) * hidden_size * 2 + hc_mult * warps_per_head * 4
@@ -244,6 +255,7 @@ def get_engram_gate_bwd_kernel(
         return result
 
     v_vec_size = _choose_v_vec_size(elems_per_thread)
+    go_vec_size = _choose_go_vec_size(hidden_size, threads_per_head)
     go_blk_d = _choose_go_blk_d(hidden_size, threads_per_head * go_vec_size)
     x_blk_d = _choose_x_blk_d(hidden_size, threads_per_head * x_vec_size, hc_mult, warps_per_head)
 
@@ -378,7 +390,9 @@ def get_engram_gate_bwd_kernel(
                 T.copy(weight_fused[:, :x_blk_d], w_smem[0, :, :], loop_layout=x_copy_layout)
 
                 # Gate derivative
-                dldg_r[0] = dldg_smem[head_id, 0] + dldg_smem[head_id, 1]
+                T.clear(dldg_r)
+                for i_w in T.unroll(warps_per_head):
+                    dldg_r[0] += dldg_smem[head_id, i_w]
                 dldg_r[0] = T.Select(
                     T.abs(dot_in_local) * scalar * rstd_x_local * rstd_k_local < clamp_value,
                     0.0,
