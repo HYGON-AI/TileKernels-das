@@ -8,8 +8,8 @@ from tile_kernels.utils import align
 
 
 @T.macro
-def divide_task(length: int, num_tasks: int, task_id: int, start: T.Ref, end: T.Ref):
-    length_per_task = align(T.ceildiv(length, num_tasks), 32)
+def divide_task(length: int, num_tasks: int, task_id: int, start: T.Ref, end: T.Ref, task_align: int):
+    length_per_task = align(T.ceildiv(length, num_tasks), task_align)
     start = task_id * length_per_task
     end = T.min(start + length_per_task, length)
 
@@ -31,7 +31,10 @@ def get_get_fused_mapping_kernel(
     while num_threads < num_experts:
         num_threads *= 2
     assert num_threads <= 1024 and num_threads >= num_experts
-    warp_size = 32
+    # Keep warp semantics backend-specific.
+    # HCU/HIP wavefront is 64, CUDA warp is 32.
+    is_hcu = torch.version.hip is not None
+    warp_size = 64 if is_hcu else 32
     num_warps = num_threads // warp_size
 
     num_global_warps = num_sms * num_warps
@@ -85,7 +88,7 @@ def get_get_fused_mapping_kernel(
 
             start = T.alloc_var(T.int32)
             end = T.alloc_var(T.int32)
-            divide_task(numel, num_global_warps, global_warp_idx, start, end)
+            divide_task(numel, num_global_warps, global_warp_idx, start, end, warp_size)
 
             for i in T.serial(start + lane_idx, end, warp_size):
                 T.assume(0 <= i < numel)
@@ -137,15 +140,25 @@ def get_get_fused_mapping_kernel(
                     expert_end[thread_idx] = exclusive_prefix + expert_num_elements_aligned
             T.sync_threads()
 
-            divide_task(numel, num_global_warps, global_warp_idx, start, end)
+            divide_task(numel, num_global_warps, global_warp_idx, start, end, warp_size)
             aligned_end = align(end, warp_size)
-            lane_mask = T.uint32(1 << lane_idx) + T.uint32(1 << lane_idx) - 1
-            lane_mask_rev = ~lane_mask
+            if is_hcu:
+                lane_mask = T.uint64(1) << T.uint64(lane_idx)
+                lane_mask = lane_mask + lane_mask - T.uint64(1)
+                lane_mask_rev = ~lane_mask
+            else:
+                lane_mask = T.uint32(1 << lane_idx) + T.uint32(1 << lane_idx) - 1
+                lane_mask_rev = ~lane_mask
             for i in T.serial(start + lane_idx, aligned_end, warp_size):
                 T.assume(0 <= i)
                 expert_idx = T.Select(i < numel, T.int32(topk_idx_1d[i]), -1)
-                mask = T.call_extern(T.uint32, '__match_any_sync', 0xFFFFFFFF, expert_idx)
-                count = T.popcount(mask & lane_mask)
+                if is_hcu:
+                    # #ifdef HCU: use HCU helper implementation.
+                    mask = T.call_extern(T.uint64, 'tl::match_any_sync', T.uint64(0xFFFFFFFFFFFFFFFF), expert_idx)
+                    count = T.popcount(T.uint32(mask & lane_mask))
+                else:
+                    mask = T.call_extern(T.uint32, '__match_any_sync', 0xFFFFFFFF, expert_idx)
+                    count = T.popcount(mask & lane_mask)
 
                 if i < numel and expert_idx >= 0:
                     T.assume(expert_idx < num_experts)
