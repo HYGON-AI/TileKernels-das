@@ -1,11 +1,18 @@
 import os
 from functools import partial
+from typing import Optional, Tuple
 
 import torch
 import tilelang
 from tilelang import language as T
 
 from tile_kernels.config import get_max_smem_per_sm, get_num_sms
+from tile_kernels.engram.engram_gate_bwd_reload_helpers import (
+    choose_reload_hidden_block,
+    engram_gate_bwd_go_vec_size,
+    engram_gate_bwd_reload_pipeline_exceeds_smem_budget,
+    engram_gate_bwd_v_vec_size,
+)
 
 
 @tilelang.jit(
@@ -481,6 +488,230 @@ def get_engram_gate_bwd_kernel(
     return engram_gate_bwd_kernel
 
 
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+        tilelang.PassConfigKey.TL_DISABLE_OUT_OF_BOUND_WARNING: True,
+    },
+)
+def get_engram_gate_bwd_reload_kernel(
+    hidden_size: int,
+    scalar: float,
+    k_stride_s: int,
+    k_stride_h: int,
+    v_stride_s: int,
+    num_persistent_blocks: int,
+    clamp_value: float = 1e-6,
+    hc_mult: int = 4,
+):
+    """Low-LDS backward (reload path): same thread-local subtiles as ``get_engram_gate_bwd_kernel``, two ``grad_out`` scans.
+
+    No ``go_smem(hidden)``: each pass streams ``h_blk`` slices. Pass 1 combines dldg + grad_v per slice;
+    Pass 2 recomputes ``grad_out`` + x/k/w for grad_x/k/w. No pipelined prefetch.
+    """
+
+    assert hc_mult == 4
+    num_tokens = T.dynamic('num_tokens')
+    warp_size = 64 if torch.version.hip is not None else 32
+    warps_per_head = 1 if torch.version.hip is not None else 2
+    num_warps = hc_mult * warps_per_head
+    threads = warp_size * num_warps
+    threads_per_head = warp_size * warps_per_head
+    assert hidden_size % threads == 0
+    elems_per_thread = hidden_size // threads
+    elems_per_warp_pair = hidden_size // threads_per_head
+    x_vec_size = 4
+
+    v_vec_size = engram_gate_bwd_v_vec_size(elems_per_thread)
+    go_vec_size = engram_gate_bwd_go_vec_size(hidden_size, threads_per_head)
+    threads, h_blk = choose_reload_hidden_block(hidden_size, hc_mult)
+    print(f'h_blk: {h_blk}, threads: {threads}')
+    num_slices = hidden_size // h_blk
+    assert h_blk % (threads_per_head * go_vec_size) == 0
+    assert h_blk % (threads_per_head * x_vec_size) == 0
+    assert h_blk % (threads * v_vec_size) == 0
+
+    def smem_layout(i, j, vs):
+        thread_id = i * threads_per_head + (j // vs) % threads_per_head
+        local_id = (j % vs) + (j // (threads_per_head * vs)) * vs
+        return thread_id, local_id
+
+    go_copy_layout = T.Fragment((hc_mult, h_blk), forward_fn=partial(smem_layout, vs=go_vec_size))
+    x_copy_layout = T.Fragment((hc_mult, h_blk), forward_fn=partial(smem_layout, vs=x_vec_size))
+
+    @T.prim_func
+    def engram_gate_bwd_reload_kernel(
+        grad_out: T.Tensor[(num_tokens, hc_mult, hidden_size), T.bfloat16],
+        hidden_states: T.Tensor[(num_tokens, hc_mult, hidden_size), T.bfloat16],
+        k: T.StridedTensor[(num_tokens, hc_mult, hidden_size), (k_stride_s, k_stride_h, 1), T.bfloat16],
+        v: T.StridedTensor[(num_tokens, hidden_size), (v_stride_s, 1), T.bfloat16],
+        weight_fused: T.Tensor[(hc_mult, hidden_size), T.float],
+        dot_in: T.Tensor[(num_tokens, hc_mult), T.float],
+        gate_in: T.Tensor[(num_tokens, hc_mult), T.float],
+        rstd_x_in: T.Tensor[(num_tokens, hc_mult), T.float],
+        rstd_k_in: T.Tensor[(num_tokens, hc_mult), T.float],
+        grad_x: T.Tensor[(num_tokens, hc_mult, hidden_size), T.bfloat16],
+        grad_k: T.Tensor[(num_tokens, hc_mult, hidden_size), T.bfloat16],
+        grad_v: T.Tensor[(num_tokens, hidden_size), T.bfloat16],
+        grad_w_partial: T.Tensor[(num_persistent_blocks, hc_mult, hidden_size), T.float],
+    ):
+        with T.Kernel(num_persistent_blocks, threads=threads) as pid_p:
+            tid = T.get_thread_binding()
+            warp_id = T.get_warp_idx()
+            lane_id = T.get_lane_idx()
+            head_id = warp_id // warps_per_head
+            sub_warp_id = warp_id % warps_per_head
+
+            go_local = T.alloc_local((go_vec_size,), T.float)
+            v_local = T.alloc_local((go_vec_size,), T.float)
+            go_v_local = T.alloc_local((v_vec_size,), T.float)
+            go_x_local = T.alloc_local((x_vec_size,), T.float)
+            x_local = T.alloc_local((x_vec_size,), T.float)
+            k_local = T.alloc_local((x_vec_size,), T.float)
+            w_fused_local = T.alloc_local((x_vec_size,), T.float)
+            grad_v_partial = T.alloc_local((v_vec_size,), T.float)
+
+            dldg_local = T.alloc_local((1,), T.float)
+            dldg_r = T.alloc_local((1,), T.float)
+
+            gate_local = T.alloc_local((hc_mult,), T.float)
+            gate_local_hc = T.alloc_var(T.float)
+            rstd_x_local = T.alloc_var(T.float)
+            rstd_k_local = T.alloc_var(T.float)
+            dot_in_local = T.alloc_var(T.float)
+            dot_x_local = T.alloc_var(T.float)
+            dot_k_local = T.alloc_var(T.float)
+
+            go_bb = T.alloc_shared((hc_mult, h_blk), T.bfloat16)
+            v_bb = T.alloc_shared((h_blk,), T.bfloat16)
+            xh_bb = T.alloc_shared((hc_mult, h_blk), T.bfloat16)
+            kh_bb = T.alloc_shared((hc_mult, h_blk), T.bfloat16)
+            wf_bb = T.alloc_shared((hc_mult, h_blk), T.float)
+            dldg_smem = T.alloc_shared((hc_mult, warps_per_head), T.float)
+
+            grad_w_local = T.alloc_local((elems_per_warp_pair,), T.float)
+
+            go_sub_blks_slice = h_blk // (threads_per_head * go_vec_size)
+            x_sub_blks_slice = h_blk // (threads_per_head * x_vec_size)
+            i_grp_per_slice = h_blk // (threads * v_vec_size)
+
+            per_block = T.ceildiv(num_tokens, num_persistent_blocks)
+            t_start = T.min(per_block * pid_p, num_tokens)
+            t_end = T.min(per_block * (pid_p + 1), num_tokens)
+
+            T.clear(grad_w_local)
+
+            for i_s in T.serial(t_start, t_end):
+                T.copy(gate_in[i_s, :], gate_local)
+                gate_local_hc = gate_in[i_s, head_id]
+                rstd_x_local = rstd_x_in[i_s, head_id]
+                rstd_k_local = rstd_k_in[i_s, head_id]
+                dot_in_local = dot_in[i_s, head_id]
+
+                T.clear(dldg_local)
+
+                # Pass 1: stream grad_out + v — dldg (local + warp) and grad_v per slice
+                for i_sl in T.serial(num_slices):
+                    slice_lo = i_sl * h_blk
+                    T.copy(grad_out[i_s, :, slice_lo : slice_lo + h_blk], go_bb, loop_layout=go_copy_layout)
+                    T.copy(v[i_s, slice_lo : slice_lo + h_blk], v_bb)
+                    T.sync_threads()
+
+                    for i_sub in T.serial(go_sub_blks_slice):
+                        go_base_rel = (
+                            i_sub * threads_per_head * go_vec_size
+                            + sub_warp_id * warp_size * go_vec_size
+                        )
+                        for i_k in T.vectorized(go_vec_size):
+                            go_local[i_k] = go_bb[head_id, go_base_rel + lane_id * go_vec_size + i_k]
+                            v_local[i_k] = v_bb[go_base_rel + lane_id * go_vec_size + i_k]
+                        for i_k in T.serial(go_vec_size):
+                            dldg_local[0] += go_local[i_k] * v_local[i_k]
+
+                    for jj in T.serial(i_grp_per_slice):
+                        T.clear(grad_v_partial)
+                        for i_h in T.unroll(hc_mult):
+                            for i_k in T.vectorized(v_vec_size):
+                                flat = (
+                                    jj * threads * v_vec_size
+                                    + tid * v_vec_size
+                                    + i_k
+                                )
+                                go_v_local[i_k] = go_bb[i_h, flat]
+                            for i_k in T.vectorized(v_vec_size):
+                                grad_v_partial[i_k] += go_v_local[i_k] * gate_local[i_h]
+                        for i_k in T.vectorized(v_vec_size):
+                            gidx = (
+                                slice_lo
+                                + jj * threads * v_vec_size
+                                + tid * v_vec_size
+                                + i_k
+                            )
+                            grad_v[i_s, gidx] = grad_v_partial[i_k]
+
+                dldg_local[0] = T.warp_reduce_sum(dldg_local[0])
+                if lane_id == 0:
+                    dldg_smem[head_id, sub_warp_id] = dldg_local[0]
+                T.sync_threads()
+
+                T.clear(dldg_r)
+                for i_w in T.unroll(warps_per_head):
+                    dldg_r[0] += dldg_smem[head_id, i_w]
+                dldg_r[0] = T.Select(
+                    T.abs(dot_in_local) * scalar * rstd_x_local * rstd_k_local < clamp_value,
+                    0.0,
+                    dldg_r[0]
+                    * gate_local_hc
+                    * (1.0 - gate_local_hc)
+                    * 0.5
+                    * T.sqrt(scalar * rstd_x_local * rstd_k_local / T.abs(dot_in_local)),
+                )
+
+                dot_x_local = dot_in_local * rstd_x_local * rstd_x_local / hidden_size
+                dot_k_local = dot_in_local * rstd_k_local * rstd_k_local / hidden_size
+
+                # Pass 2: stream grad_out again + x/k/w (serial slices, no prefetch)
+                for i_sl in T.serial(num_slices):
+                    slice_lo = i_sl * h_blk
+                    T.copy(grad_out[i_s, :, slice_lo : slice_lo + h_blk], go_bb, loop_layout=go_copy_layout)
+                    T.copy(hidden_states[i_s, :, slice_lo : slice_lo + h_blk], xh_bb, loop_layout=x_copy_layout)
+                    T.copy(k[i_s, :, slice_lo : slice_lo + h_blk], kh_bb, loop_layout=x_copy_layout)
+                    T.copy(weight_fused[:, slice_lo : slice_lo + h_blk], wf_bb, loop_layout=x_copy_layout)
+                    T.sync_threads()
+
+                    for i_sub in T.serial(x_sub_blks_slice):
+                        sub_off = (
+                            i_sub * (threads_per_head * x_vec_size)
+                            + sub_warp_id * (warp_size * x_vec_size)
+                        )
+                        global_base = slice_lo + sub_off
+                        reg_base = (i_sl * x_sub_blks_slice + i_sub) * x_vec_size
+                        for i_k in T.vectorized(x_vec_size):
+                            go_x_local[i_k] = go_bb[head_id, sub_off + lane_id * x_vec_size + i_k]
+                            x_local[i_k] = xh_bb[head_id, sub_off + lane_id * x_vec_size + i_k]
+                            k_local[i_k] = kh_bb[head_id, sub_off + lane_id * x_vec_size + i_k]
+                            w_fused_local[i_k] = wf_bb[head_id, sub_off + lane_id * x_vec_size + i_k]
+                        for i_k in T.vectorized(x_vec_size):
+                            grad_x[i_s, head_id, global_base + lane_id * x_vec_size + i_k] = (
+                                go_x_local[i_k]
+                                + dldg_r[0]
+                                * (k_local[i_k] * w_fused_local[i_k] - x_local[i_k] * dot_x_local)
+                            )
+                            grad_k[i_s, head_id, global_base + lane_id * x_vec_size + i_k] = dldg_r[0] * (
+                                x_local[i_k] * w_fused_local[i_k] - k_local[i_k] * dot_k_local
+                            )
+                        for i_k in T.serial(x_vec_size):
+                            grad_w_local[reg_base + i_k] += dldg_r[0] * x_local[i_k] * k_local[i_k]
+
+            for i_reg in T.unroll(elems_per_warp_pair // x_vec_size):
+                global_off = (i_reg * threads_per_head + sub_warp_id * warp_size + lane_id) * x_vec_size
+                for i_k in T.vectorized(x_vec_size):
+                    grad_w_partial[pid_p, head_id, global_off + i_k] = grad_w_local[i_reg * x_vec_size + i_k]
+
+    return engram_gate_bwd_reload_kernel
+
+
 def engram_gate_fwd(
     hidden_states: torch.Tensor,
     k: torch.Tensor,
@@ -489,7 +720,7 @@ def engram_gate_fwd(
     eps: float,
     clamp_value: float,
     save_for_backward: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Engram gate forward pass.
 
     Args:
@@ -550,7 +781,7 @@ def engram_gate_bwd(
     rstd_x: torch.Tensor,
     rstd_k: torch.Tensor,
     clamp_value: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Engram gate backward: computes grad_hidden_states, grad_k, grad_v, grad_w_partial.
 
     Args:
@@ -576,7 +807,22 @@ def engram_gate_bwd(
     k_stride_s, k_stride_h, _ = k.stride()
     v_stride_s, _ = v.stride()
 
-    kernel = get_engram_gate_bwd_kernel(hidden_size, scalar, k_stride_s, k_stride_h, v_stride_s, get_num_sms(), clamp_value, hc_mult)
+    force_reload = os.environ.get('TK_ENGRAM_GATE_BWD_FORCE_FRAGMENT') in {'1', 'true', 'True'}
+    use_reload = force_reload or engram_gate_bwd_reload_pipeline_exceeds_smem_budget(hidden_size, hc_mult)
+    kw = dict(
+        scalar=scalar,
+        k_stride_s=k_stride_s,
+        k_stride_h=k_stride_h,
+        v_stride_s=v_stride_s,
+        num_persistent_blocks=get_num_sms(),
+        clamp_value=clamp_value,
+        hc_mult=hc_mult,
+    )
+    kernel = (
+        get_engram_gate_bwd_reload_kernel(hidden_size, **kw)
+        if use_reload
+        else get_engram_gate_bwd_kernel(hidden_size, **kw)
+    )
     if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
         print(kernel.get_kernel_source())
 
