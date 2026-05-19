@@ -79,6 +79,7 @@ DEFAULT_TILELANG_KERNEL_SUBSTRS: tuple[str, ...] = (
     "mhc_pre_gemm_sqrsum_splitk_stage_1",
     "_mhc_pre_norm_fn_fwd_mul_kernel",
     "mhc_pre_big_fuse",
+    "_round_to_tf32_prim",
 )
 
 # 与 pre_big_fuse.py / tile_kernels/mhc 中 prim_func 命名一致；首匹配分桶
@@ -87,6 +88,7 @@ PROFILER_BUCKETS: tuple[tuple[str, str], ...] = (
     ("fwd_mul_splitk_s1", "mhc_pre_gemm_sqrsum_splitk_stage_1"),
     ("fwd_mul_gemm", "_mhc_pre_norm_fn_fwd_mul_kernel"),
     ("big_fuse", "mhc_pre_big_fuse"),
+    ("round_to_tf32", "_round_to_tf32_prim"),
 )
 
 
@@ -317,7 +319,6 @@ def benchmark_one_shape(
         f"    Profiler total ({filter_note}, eager forward) (ms): mean={prof_total[0]:.3f}  "
         f"min={prof_total[1]:.3f}  max={prof_total[2]:.3f}"
     )
-
     if bucks:
         order = [n for n, _ in PROFILER_BUCKETS] + ["other"]
         parts = []
@@ -414,7 +415,7 @@ def main() -> None:
             use_cuda_graph=use_cuda_graph,
         )
     else:
-        n1_list = [1, 16, 32, 64, 128, 256, 512, 2048, 4096, 6912, 8192]
+        n1_list = [1, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 6912, 8192, 16384]
         hidden_list = [4096, 7168]
         for n1 in n1_list:
             for hs in hidden_list:
