@@ -93,8 +93,8 @@ def big_fuse_reference(
     return post_mix, comb_mix, layer_input
 
 
-@pytest.mark.parametrize('n1', [512, 1024, 2048, 8192])
-@pytest.mark.parametrize('hidden_size', [1280, 2560, 4096])
+@pytest.mark.parametrize('n1', [1, 34, 65, 133, 288, 577, 1010, 2722, 4572, 8192, 9217, 21111])
+@pytest.mark.parametrize('hidden_size', [1280, 2560, 4096, 7168])
 @pytest.mark.parametrize('mhc_mult', [4])
 def test_correctness(
     n1: int,

@@ -8,3 +8,4 @@ from .pre_apply_mix import mhc_pre_apply_mix
 from .pre_big_fuse import mhc_pre_big_fuse
 from .pre_split_mixes import mhc_pre_split_mixes
 from .sinkhorn import sinkhorn_normalize
+from .hc_split_sinkhorn import hc_split_sinkhorn

@@ -10,6 +10,7 @@ from tilelang import language as T
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
         tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     },
 )
 def _mhc_pre_big_fuse(
@@ -38,26 +39,56 @@ def _mhc_pre_big_fuse(
         comb_mix: T.Tensor[(num_tokens, mhc_mult * mhc_mult), T.float32],
         layer_input: T.Tensor[(num_tokens, hidden_size), T.bfloat16],
     ) -> None:
-        with T.Kernel(num_tokens, threads=128) as pid:
+        threads = 128
+        if n_splits >= 4:
+            split_groups = threads // 32
+            assert n_splits % split_groups == 0
+            group_rows = n_splits // split_groups
+        with T.Kernel(num_tokens, threads=threads) as pid:
             ##################################################################
             # _mhc_pre_norm_fn_fwd_norm
+            tx = T.get_thread_binding()
             mixes_shared = T.alloc_shared(mhc_mult3, T.float32)
-            if T.get_thread_binding() < 64:
-                rms = T.alloc_fragment(1, T.float32)
-                mixes = T.alloc_fragment(mhc_mult3, T.float32)
-                T.clear(mixes)
-                rms[0] = 0
-                for i_split in T.serial(n_splits):
-                    rms[0] += gemm_out_sqrsum[i_split, pid]
+            rms = T.alloc_fragment(1, T.float32)
+
+            if n_splits >= 4:
+                sqrsum = T.alloc_fragment(n_splits, T.float32)
+                T.copy(gemm_out_sqrsum[:, pid], sqrsum)
+                T.reduce_sum(sqrsum, rms)
                 rms[0] = T.rsqrt(rms[0] / (mhc_mult * hidden_size) + rms_eps)
+                mixes_pre = T.alloc_fragment((split_groups, 32), T.float32)
+                mixes_aligned = T.alloc_fragment(32, T.float32)
+                T.clear(mixes_pre)
+                for r in T.serial(group_rows):
+                    for i, j in T.Parallel(split_groups, 32):
+                        if j < mhc_mult3:
+                            mixes_pre[i, j] += gemm_out_mul[i * group_rows + r, pid, j]
+                T.reduce_sum(mixes_pre, mixes_aligned, dim=0)
+                for i in T.Parallel(32):
+                    if i < mhc_mult3:
+                        mixes_shared[i] = mixes_aligned[i] * rms[0]
+            elif n_splits >= 2:
+                sqrsum = T.alloc_fragment(n_splits, T.float32)
+                T.copy(gemm_out_sqrsum[:, pid], sqrsum)
+                T.reduce_sum(sqrsum, rms)
+                rms[0] = T.rsqrt(rms[0] / (mhc_mult * hidden_size) + rms_eps)
+                mixes = T.alloc_fragment(mhc_mult3, T.float32)
                 for j in T.Parallel(mhc_mult3):
                     mixes[j] = 0
-                    for i_split in T.serial(n_splits):
-                        mixes[j] += gemm_out_mul[i_split, pid, j]
+                    for i in T.serial(n_splits):
+                        mixes[j] += gemm_out_mul[i, pid, j]
+                    mixes[j] *= rms[0]
+                T.copy(mixes, mixes_shared, disable_tma=True)
+            else:
+                rms[0] = gemm_out_sqrsum[0, pid]
+                rms[0] = T.rsqrt(rms[0] / (mhc_mult * hidden_size) + rms_eps)
+                mixes = T.alloc_fragment(mhc_mult3, T.float32)
+                for j in T.Parallel(mhc_mult3):
+                    mixes[j] = gemm_out_mul[0, pid, j]
                     mixes[j] *= rms[0]
                 T.copy(mixes, mixes_shared, disable_tma=True)
 
-            if T.get_thread_binding() < 64:
+            if tx < 64:
                 ##################################################################
                 # _mhc_pre_split_mixes_fwd (post & comb)
                 cm = T.alloc_fragment((mhc_mult, mhc_mult), T.float32)
@@ -102,8 +133,8 @@ def _mhc_pre_big_fuse(
             else:
                 ##################################################################
                 # _mhc_pre_split_mixes_fwd (pre)
-                pre_mix_shared = T.alloc_shared(mhc_mult, T.float32)
-                for j in T.Parallel(mhc_mult):
+                pre_mix_shared = T.alloc_fragment(mhc_mult, T.float32)
+                for j in T.serial(mhc_mult):
                     pre_mix_shared[j] = (
                         T.sigmoid(
                             mixes_shared[j] * mhc_scale[0] + mhc_base[j],

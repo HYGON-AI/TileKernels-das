@@ -67,9 +67,9 @@ def _estimate_bwd_io_bytes(n0: int, n1: int, h: int, mhc_mult: int) -> int:
     return read_bytes + write_bytes
 
 
-@pytest.mark.parametrize('n0', [1, 2])
-@pytest.mark.parametrize('n1', [4096])
-@pytest.mark.parametrize('h', [1280, 2560, 7168])
+@pytest.mark.parametrize('n0', [1])
+@pytest.mark.parametrize('n1', [1, 16, 32, 4096])
+@pytest.mark.parametrize('h', [1280, 2560, 4096, 7168])
 def test_mhc_post_comprehensive(n0: int, n1: int, h: int) -> None:
     test_data = generate_mhc_post_test_data(n0=n0, n1=n1, h=h, mhc_mult=4)
 
@@ -104,10 +104,35 @@ def test_mhc_post_comprehensive(n0: int, n1: int, h: int) -> None:
 @pytest.mark.parametrize(
     'n0,n1,h,mhc_mult',
     [
-        (1, 4096, 1280, 4),
-        (1, 4096, 2560, 4),
-        (1, 4096, 7168, 4),
-        (2, 4096, 2560, 4),
+        # (1, 4096, 1280, 4),
+        # (1, 4096, 2560, 4),
+        # (1, 4096, 7168, 4),
+        # (2, 4096, 2560, 4),
+        
+        # h = 7168
+        # (1, 1, 7168, 4),
+        # (1, 32, 7168, 4),
+        # (1, 64, 7168, 4),
+        # (1, 128, 7168, 4),
+        # (1, 256, 7168, 4),
+        # (1, 512, 7168, 4),
+        # (1, 1024, 7168, 4),
+        # (1, 2048, 7168, 4),
+        # (1, 8192, 7168, 4),
+        # (1, 65536, 7168, 4),
+        
+        # h = 4096
+        (1, 1, 4096, 4),
+        (1, 32, 4096, 4),
+        (1, 64, 4096, 4),
+        (1, 128, 4096, 4),
+        (1, 256, 4096, 4),
+        (1, 512, 4096, 4),
+        (1, 1024, 4096, 4),
+        (1, 2048, 4096, 4),
+        (1, 8192, 4096, 4),
+        (1, 65536, 4096, 4),
+        
     ],
 )
 def test_mhc_post_fwd_benchmark(
