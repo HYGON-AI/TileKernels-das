@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from tile_kernels.engram import engram_gate_fwd
-from tile_kernels.torch.engram import engram_gate_ref
+from tile_kernels.torch.engram import engram_gate_ref, engram_gate_ref_tilelang_reduction_order
 from tile_kernels.testing.numeric import assert_equal, calc_diff, count_bytes
 from tile_kernels.testing.generator import generate_hidden_sizes, generate_num_tokens
 from tile_kernels.testing.bench import make_param_id
@@ -34,6 +34,43 @@ def generate_test_params(is_benchmark: bool) -> list[dict]:
         for hc in (4,)
         for hidden_size in generate_hidden_sizes(128)
     ]
+
+
+@pytest.mark.parametrize('params', generate_test_params(is_benchmark=False), ids=make_param_id)
+def test_engram_gate_fwd_alg_ref_matches_tilelang_accum_order(params):
+    """Fwd kernel vs Torch ref built with the **same reduction traversal** as TileLang (all grid sizes like ``test_engram_gate_fwd``)."""
+    (
+        x_data,
+        k_data,
+        v_data,
+        _wh,
+        _we,
+        weight_fused,
+        eps,
+        clamp_value,
+    ) = generate_test_data(params)
+
+    out_tl_accum, dot_t, gs_t, rx_t, rk_t = engram_gate_ref_tilelang_reduction_order(
+        x_data, k_data, v_data, weight_fused, clamp_value, eps, save_for_backward=True,
+    )
+    out_k, dot_k, gs_k, rx_k, rk_k = engram_gate_fwd(
+        x_data,
+        k_data,
+        v_data,
+        weight_fused,
+        eps,
+        clamp_value,
+        save_for_backward=True,
+    )
+    for name, a, b in (
+        ('dot', dot_k, dot_t),
+        ('gate_score', gs_k, gs_t),
+        ('rstd_x', rx_k, rx_t),
+        ('rstd_k', rk_k, rk_t),
+        ('out', out_k, out_tl_accum),
+    ):
+        diff = calc_diff(a, b)
+        assert diff < 2e-10, f'tilelang vs accum-order ref mismatch on {name}: {diff:.6e}'
 
 
 @pytest.mark.parametrize('params', generate_test_params(is_benchmark=False), ids=make_param_id)
