@@ -40,9 +40,12 @@ def _mhc_pre_big_fuse(
         layer_input: T.Tensor[(num_tokens, hidden_size), T.bfloat16],
     ) -> None:
         threads = 128
+        
+        n_splits_aligned = tilelang.math.next_power_of_2(n_splits)
+        
         if n_splits >= 4:
             split_groups = threads // 32
-            assert n_splits % split_groups == 0
+            # assert n_splits % split_groups == 0
             group_rows = n_splits // split_groups
         with T.Kernel(num_tokens, threads=threads) as pid:
             ##################################################################
@@ -51,8 +54,8 @@ def _mhc_pre_big_fuse(
             mixes_shared = T.alloc_shared(mhc_mult3, T.float32)
             rms = T.alloc_fragment(1, T.float32)
 
-            if n_splits >= 4:
-                sqrsum = T.alloc_fragment(n_splits, T.float32)
+            if n_splits >= 4 and n_splits % split_groups == 0:
+                sqrsum = T.alloc_fragment(n_splits_aligned, T.float32)
                 T.copy(gemm_out_sqrsum[:, pid], sqrsum)
                 T.reduce_sum(sqrsum, rms)
                 rms[0] = T.rsqrt(rms[0] / (mhc_mult * hidden_size) + rms_eps)
@@ -68,7 +71,7 @@ def _mhc_pre_big_fuse(
                     if i < mhc_mult3:
                         mixes_shared[i] = mixes_aligned[i] * rms[0]
             elif n_splits >= 2:
-                sqrsum = T.alloc_fragment(n_splits, T.float32)
+                sqrsum = T.alloc_fragment(n_splits_aligned, T.float32)
                 T.copy(gemm_out_sqrsum[:, pid], sqrsum)
                 T.reduce_sum(sqrsum, rms)
                 rms[0] = T.rsqrt(rms[0] / (mhc_mult * hidden_size) + rms_eps)
