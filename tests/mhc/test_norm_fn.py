@@ -1,7 +1,8 @@
 import pytest
 import torch
 from tile_kernels.modeling.mhc.ops import mhc_pre_norm_fn
-from tile_kernels.torch.mhc import mhc_pre_norm_fn_ref
+# from tile_kernels.torch.mhc import mhc_pre_norm_fn_ref
+from tile_kernels.torch.mhc import mhc_pre_norm_fn_ref_tl_align
 
 
 def generate_norm_fn_test_data(
@@ -77,15 +78,13 @@ def test_correctness(
     residual_tl_grad = residual_tl.untyped_storage().grad_from_mhc_post = torch.zeros_like(residual_tl)
     torch.autograd.backward([out_tl], [test_data['out_grad']])
 
-    torch.backends.cuda.matmul.allow_tf32 = True
-    out_ref = mhc_pre_norm_fn_ref(
+    out_ref = mhc_pre_norm_fn_ref_tl_align(
         residual_ref,
         fn_ref,
         normw_ref,
         test_data['mhc_norm_eps'],
     )
     torch.autograd.backward([out_ref], [test_data['out_grad']])
-    torch.backends.cuda.matmul.allow_tf32 = False
 
     torch.testing.assert_close(out_tl, out_ref, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(residual_tl_grad, residual_ref.grad)
@@ -118,13 +117,11 @@ def test_split_k_correctness(n1: int, hidden_size: int) -> None:
         n_splits=16,
     )
 
-    torch.backends.cuda.matmul.allow_tf32 = True
-    out_ref = mhc_pre_norm_fn_ref(
+    out_ref = mhc_pre_norm_fn_ref_tl_align(
         residual_ref,
         fn_ref,
         None,
         test_data['mhc_norm_eps'],
     )
-    torch.backends.cuda.matmul.allow_tf32 = False
 
     torch.testing.assert_close(out_tl, out_ref, atol=1e-3, rtol=1e-3)
