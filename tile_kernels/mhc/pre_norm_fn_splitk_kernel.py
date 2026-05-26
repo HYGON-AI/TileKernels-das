@@ -42,28 +42,42 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
             T.clear(out_frag)
             T.clear(sq_part4)
 
+            x_frag_pre = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
+            fn_frag_pre = T.alloc_fragment((32, hidden_block), T.float32)
+            x_frag_16 = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
+            x_frag = T.alloc_fragment((token_block, hidden_block), T.float32)
+            fn_frag = T.alloc_fragment((32, hidden_block), T.float32)
+
             k_base = bz * split_size
+            num_k = split_size // hidden_block
 
-            for pz in T.Pipelined(split_size // hidden_block, num_stages=0):
-                x_frag_pre = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
-                fn_frag_pre = T.alloc_fragment((32, hidden_block), T.float32)
-                x_frag_16 = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
-                x_frag = T.alloc_fragment((token_block, hidden_block), T.float32)
-                fn_frag = T.alloc_fragment((32, hidden_block), T.float32)
+            # Hand-rolled prefetch: head staging (pre->smem->frag), prefetch next
+            # while fn smem runs, then gemm. x/fn smem time-multiplex to 32KB.
+            T.copy(x[px * token_block, k_base], x_frag_pre)
+            T.copy(fn[0, k_base], fn_frag_pre)
 
+            for pz in T.serial(0, num_k):
                 x_smem_16 = T.alloc_shared((token_block, hidden_block), T.bfloat16)
                 fn_smem = T.alloc_shared((32, hidden_block), T.float32)
                 T.annotate_layout({x_smem_16: tilelang.layout.make_hcu_swizzled_layout(x_smem_16, major_pack=2)})
                 T.annotate_layout({fn_smem: tilelang.layout.make_hcu_swizzled_layout(fn_smem, major_pack=2)})
 
-                T.copy(x[px * token_block, k_base + pz * hidden_block], x_frag_pre)
-                T.copy(fn[0, k_base + pz * hidden_block], fn_frag_pre)
-
                 T.copy(x_frag_pre, x_smem_16)
                 T.copy(x_smem_16, x_frag_16)
                 T.copy(x_frag_16, x_frag)
+                if pz + 1 < num_k:
+                    T.copy(
+                        x[px * token_block, k_base + (pz + 1) * hidden_block],
+                        x_frag_pre,
+                    )
                 T.copy(fn_frag_pre, fn_smem)
                 T.copy(fn_smem, fn_frag)
+                if pz + 1 < num_k:
+                    T.copy(
+                        fn[0, k_base + (pz + 1) * hidden_block],
+                        fn_frag_pre,
+                    )
+
                 for jj in T.serial(hidden_block // 16):
                     for i, j in T.Parallel(token_block, 16):
                         v = x_frag[i, jj * 16 + j]
