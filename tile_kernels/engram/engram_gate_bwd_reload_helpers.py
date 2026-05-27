@@ -104,23 +104,81 @@ def _reload_h_blk_alignment(hidden_size: int, hc_mult: int) -> int:
     return lcm_ab // math.gcd(lcm_ab, c) * c
 
 
+RELOAD_PASS2_X_VEC_SIZE = 4
+
+
+def _reload_pass2_h_blk_alignment(hc_mult: int) -> int:
+    """Pass2 uses ``x_vec_size=4`` copy/compute subtiles."""
+    warp_size, warps_per_head = _engram_bwd_warp_layout()
+    threads_per_head = warp_size * warps_per_head
+    return threads_per_head * RELOAD_PASS2_X_VEC_SIZE
+
+
+def _reload_pass1_pingpong_bytes(h_blk: int, hc_mult: int) -> int:
+    return 2 * (hc_mult * h_blk * 2 + h_blk * 2)
+
+
+def _reload_pass2_pingpong_bytes(h_blk: int, hc_mult: int) -> int:
+    single = hc_mult * h_blk * (2 + 2 + 2 + 4)
+    return 2 * single
+
+
+@functools.lru_cache(maxsize=None)
+def estimate_engram_gate_bwd_reload_pingpong_smem_bytes(
+    hidden_size: int, hc_mult: int = 4, budget_bytes: int | None = None
+) -> int:
+    """Conservative SMEM estimate for reload ping-pong (Pass1 + Pass2 buffers, no merge)."""
+    if budget_bytes is None:
+        budget_bytes = get_max_smem_per_sm()
+    _, h_blk1 = choose_reload_hidden_block(hidden_size, hc_mult)
+    h_blk2 = choose_reload_pass2_hidden_block(hidden_size, hc_mult, budget_bytes=budget_bytes)
+    dldg_b = hc_mult * _engram_bwd_warp_layout()[1] * 4
+    pass1 = _reload_pass1_pingpong_bytes(h_blk1, hc_mult)
+    pass2 = _reload_pass2_pingpong_bytes(h_blk2, hc_mult)
+    return pass1 + pass2 + dldg_b
+
+
+def reload_pass1_prefetch_wait_groups(
+    h_blk1: int,
+    threads_per_head: int,
+    go_vec_size: int,
+    threads: int,
+    v_vec_size: int,
+) -> int:
+    """``ptx_wait_group(N)`` for one Pass1 ``go_bb + v_bb`` prefetch batch (HCU).
+
+    ``go`` (Fragment, ``go_vec``) lowers to ``go_sub`` × ``cp_async_gs<go_vec*2>``.
+    ``v`` (flat) lowers to one ``cp_async_gs<v_vec*2>`` per slice (``v_groups``).
+    """
+
+    go_sub = h_blk1 // (threads_per_head * go_vec_size)
+    v_groups = h_blk1 // (threads * v_vec_size)
+    return go_sub + v_groups
+
+
+def reload_pass2_prefetch_wait_groups(x_sub_blks: int) -> int:
+    """``ptx_wait_group(N)`` for one Pass2 ``go2/xh/kh/wf`` prefetch batch (HCU).
+
+    Four buffers; each ``T.async_copy`` lowers to ``x_sub_blks`` async ops
+    (``go2/xh/kh`` → ``cp_async_gs<8>``, ``wf_bb`` fp32 → ``cp_async_gs<16>``).
+    """
+
+    return 4 * x_sub_blks
+
+
 @functools.lru_cache(maxsize=None)
 def choose_reload_hidden_block(hidden_size: int, hc_mult: int = 4):
-    """Return ``(threads, h_blk)`` for the reload path: gcd-based tiles with strict alignment.
+    """Return ``(threads, h_blk_pass1)`` for reload Pass1 (dldg + grad_v).
 
-    ``h_blk`` must divide ``hidden_size``, be a multiple of the pipeline-aligned subtile
+    ``h_blk_pass1`` must divide ``hidden_size``, be a multiple of the pipeline-aligned subtile
     (including ``threads * v_vec`` for bounded ``grad_v`` over slices).
-    Scratch peak: ``go+v`` (Pass1-in-loop) versus ``go+x+k+w+dldg`` (Pass2-in-loop).
-
-    Uses bf16 tiles only (same as pipeline ``grad_v``: no FP32 gv column buffer).
-
+    Pass1 uses ping-pong ``go``/``v`` buffers sized to this tile.
     """
 
     warp_size, warps_per_head = _engram_bwd_warp_layout()
     threads_per_head = warp_size * warps_per_head
     threads = hc_mult * threads_per_head
     align_tile = _reload_h_blk_alignment(hidden_size, hc_mult)
-    dldg_smem_reload_b = hc_mult * warps_per_head * 4
 
     candidates = []
     for h_try in (256, 384, 512, 768, 1024):
@@ -128,10 +186,7 @@ def choose_reload_hidden_block(hidden_size: int, hc_mult: int = 4):
         if blk > 0 and hidden_size % blk == 0 and blk % align_tile == 0:
             tiles = hidden_size // blk
             if tiles >= 2:
-                go_v_peak = hc_mult * blk * 2 + blk * 2
-                peak2 = blk * hc_mult * 2 + 2 * blk * hc_mult * 2 + blk * hc_mult * 4
-                smem_peak = max(go_v_peak, peak2) + dldg_smem_reload_b
-                candidates.append((smem_peak, threads, blk))
+                candidates.append((blk, threads))
     if not candidates:
         blk = align_tile
         while blk <= hidden_size // 2:
@@ -141,8 +196,51 @@ def choose_reload_hidden_block(hidden_size: int, hc_mult: int = 4):
                     return threads, blk
             blk += align_tile
         raise ValueError(
-            f'Cannot pick reload tile for hidden_size={hidden_size} (need multiple of {align_tile})'
+            f'Cannot pick reload Pass1 tile for hidden_size={hidden_size} (need multiple of {align_tile})'
         )
-    candidates.sort(key=lambda x: x[0])
-    best = candidates[0]
-    return best[1], best[2]
+    candidates.sort(key=lambda x: -x[0])
+    return candidates[0][1], candidates[0][0]
+
+
+@functools.lru_cache(maxsize=None)
+def choose_reload_pass2_hidden_block(
+    hidden_size: int, hc_mult: int = 4, budget_bytes: int | None = None
+) -> int:
+    """Return ``h_blk_pass2`` for reload Pass2 ping-pong (``x_vec_size=4``).
+
+    Prefer ``512`` when it divides ``hidden_size`` and the conservative no-merge footprint
+    fits ``budget_bytes``; otherwise pick the largest valid tile that fits.
+    """
+    if budget_bytes is None:
+        budget_bytes = get_max_smem_per_sm()
+    _, h_blk1 = choose_reload_hidden_block(hidden_size, hc_mult)
+    pass1_pp = _reload_pass1_pingpong_bytes(h_blk1, hc_mult)
+    dldg_b = hc_mult * _engram_bwd_warp_layout()[1] * 4
+    align_tile = _reload_pass2_h_blk_alignment(hc_mult)
+
+    candidates = []
+    for h_try in (512, 768, 1024, 256):
+        blk = math.gcd(hidden_size, h_try)
+        if blk > 0 and hidden_size % blk == 0 and blk % align_tile == 0:
+            tiles = hidden_size // blk
+            if tiles >= 2:
+                pass2_pp = _reload_pass2_pingpong_bytes(blk, hc_mult)
+                worst = pass1_pp + pass2_pp + dldg_b
+                if worst <= budget_bytes:
+                    candidates.append(blk)
+    if not candidates:
+        blk = align_tile
+        while blk <= hidden_size // 2:
+            if hidden_size % blk == 0 and blk % align_tile == 0:
+                tiles = hidden_size // blk
+                if tiles >= 2:
+                    pass2_pp = _reload_pass2_pingpong_bytes(blk, hc_mult)
+                    if pass1_pp + pass2_pp + dldg_b <= budget_bytes:
+                        return blk
+            blk += align_tile
+        raise ValueError(
+            f'Cannot pick reload Pass2 tile for hidden_size={hidden_size} within {budget_bytes} B'
+        )
+    if 512 in candidates:
+        return 512
+    return max(candidates)
