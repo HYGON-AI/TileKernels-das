@@ -31,7 +31,7 @@ def generate_test_data(params):
             tile_kernels.moe.get_fused_mapping(topk_idx, num_experts, 0, 128)
         )
         x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-        x = tile_kernels.moe.expand_to_fused(x, token_topk_to_pos, pos_to_token)
+        # x = tile_kernels.moe.expand_to_fused(x, token_topk_to_pos, pos_to_token)
     else:
         num_tokens = num_send_tokens
         x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')

@@ -99,6 +99,10 @@ def test_cast_back_per_token(params):
     hidden = params['hidden']
     fmt = params['fmt']
     num_per_channels = params['num_per_channels']
+    is_hcu = torch.version.hip is not None
+
+    if fmt == 'e2m1' and is_hcu:
+        pytest.skip('Skip e2m1 cast_back_per_token on HCU')
 
     # Test correctness
     x, x_fp8, x_sf, out_dtype_str, func = generate_test_data_per_token(params)
@@ -114,6 +118,12 @@ def test_cast_back_per_token(params):
 @pytest.mark.benchmark
 @pytest.mark.parametrize('params', generate_test_params_per_token(is_benchmark=True), ids=make_param_id)
 def test_cast_back_per_token_benchmark(benchmark_timer, benchmark_record, params):
+    fmt = params['fmt']
+    is_hcu = torch.version.hip is not None
+
+    if fmt == 'e2m1' and is_hcu:
+        pytest.skip('Skip e2m1 cast_back_per_token benchmark on HCU')
+
     x, x_fp8, x_sf, out_dtype_str, func = generate_test_data_per_token(params)
 
     t_us = benchmark_timer(func)

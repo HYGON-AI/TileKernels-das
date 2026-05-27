@@ -33,11 +33,12 @@ def generate_test_data(params):
     in_sf_block_k = params['in_sf_block'][1]
     out_sf_block_m = params['out_sf_block'][0]
     out_sf_block_k = params['out_sf_block'][1]
+    in_fmt = params['in_fmt']
 
     x = generate_rand_float((num_tokens, hidden))
     x = clamp_abs_ratio(x)
     x_fp4 = tile_kernels.torch.cast(
-        x, 'e2m1', (in_sf_block_m, in_sf_block_k),
+        x, in_fmt, (in_sf_block_m, in_sf_block_k),
         use_tma_aligned_col_major_sf=in_use_tma_aligned_col_major_sf,
         round_sf=in_round_sf,
         use_packed_ue8m0=in_use_packed_ue8m0,
@@ -67,6 +68,7 @@ def generate_test_params(is_benchmark: bool) -> list[dict]:
             'out_use_packed_ue8m0': out_use_packed_ue8m0,
             'out_sf_block': (out_sf_block_m, out_sf_block_k),
             'in_sf_block': (in_sf_block_m, in_sf_block_k),
+            'in_fmt': in_fmt,
         }
         for num_tokens in generate_num_tokens(is_benchmark=is_benchmark)
         for hidden_size in generate_hidden_sizes()
@@ -74,6 +76,7 @@ def generate_test_params(is_benchmark: bool) -> list[dict]:
         for out_use_tma_aligned_col_major_sf, out_round_sf, out_use_packed_ue8m0 in [(False, True, False), (True, True, True)]
         for out_sf_block_m, out_sf_block_k in ((1, 128), (32, 32), (128, 128))
         for in_sf_block_m, in_sf_block_k in ((1, 32),)
+        for in_fmt in ('e2m1',)
         if out_sf_block_m % in_sf_block_m == 0 and out_sf_block_k % in_sf_block_k == 0
     ]
     return params
@@ -81,6 +84,11 @@ def generate_test_params(is_benchmark: bool) -> list[dict]:
 
 @pytest.mark.parametrize('params', generate_test_params(is_benchmark=False), ids=make_param_id)
 def test_per_block_cast_lossless(params):
+    in_fmt = params['in_fmt']
+    is_hcu = torch.version.hip is not None
+    if in_fmt == 'e2m1' and is_hcu:
+        pytest.skip('Skip e2m1 per_block_cast_lossless on HCU')
+
     out_sf_block = params['out_sf_block']
     in_sf_block = params['in_sf_block']
 
@@ -99,6 +107,11 @@ def test_per_block_cast_lossless(params):
 @pytest.mark.benchmark
 @pytest.mark.parametrize('params', generate_test_params(is_benchmark=True), ids=make_param_id)
 def test_per_block_cast_lossless_benchmark(benchmark_timer, benchmark_record, params):
+    in_fmt = params['in_fmt']
+    is_hcu = torch.version.hip is not None
+    if in_fmt == 'e2m1' and is_hcu:
+        pytest.skip('Skip e2m1 per_block_cast_lossless benchmark on HCU')
+
     _, x_fp4, cast_func = generate_test_data(params)
 
     x_fp8 = cast_func()

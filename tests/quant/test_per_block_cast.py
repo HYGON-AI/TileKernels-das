@@ -56,10 +56,15 @@ def generate_test_params(is_benchmark: bool) -> list[dict]:
 
 @pytest.mark.parametrize('params', generate_test_params(is_benchmark=False), ids=make_param_id)
 def test_per_block_cast(params):
+    fmt = params['fmt']
     hidden = params['hidden']
     use_tma_aligned_col_major_sf = params['use_tma_aligned_col_major_sf']
     use_packed_ue8m0 = params['use_packed_ue8m0']
     block_size = params['block_size']
+    is_hcu = torch.version.hip is not None
+
+    if fmt == 'e2m1' and is_hcu:
+        pytest.skip('Skip e2m1 per_block_cast on HCU')
 
     x, base_args = generate_test_data(params)
 
@@ -93,6 +98,12 @@ def test_per_block_cast(params):
 @pytest.mark.benchmark
 @pytest.mark.parametrize('params', generate_test_params(is_benchmark=True), ids=make_param_id)
 def test_per_block_cast_benchmark(benchmark_timer, benchmark_record, params):
+    fmt = params['fmt']
+    is_hcu = torch.version.hip is not None
+
+    if fmt == 'e2m1' and is_hcu:
+        pytest.skip('Skip e2m1 per_block_cast benchmark on HCU')
+
     x, args = generate_test_data(params)
 
     x_casted, per_block_sf_inv = tile_kernels.quant.per_block_cast(**args)

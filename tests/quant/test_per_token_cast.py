@@ -85,6 +85,10 @@ def test_per_token_cast(params):
     num_per_channels = params['num_per_channels']
     x_block_size = params.get('x_block_size')
     fmt = params['fmt']
+    is_hcu = torch.version.hip is not None
+
+    if fmt == 'e2m1' and is_hcu:
+        pytest.skip('Skip e2m1 per_token_cast on HCU')
 
     in_with_sf_factor = in_dtype in (torch.float8_e4m3fn, torch.int8)
     # Test correctness
@@ -146,6 +150,11 @@ def test_per_token_cast(params):
 def test_per_token_cast_benchmark(benchmark_timer, benchmark_record, params):
     in_dtype = params['in_dtype']
     num_per_channels = params['num_per_channels']
+    fmt = params['fmt']
+    is_hcu = torch.version.hip is not None
+
+    if fmt == 'e2m1' and is_hcu:
+        pytest.skip('Skip e2m1 per_token_cast benchmark on HCU')
 
     x, _, base_args, _ = generate_test_data(params)
     func = lambda: tile_kernels.quant.per_token_cast(
