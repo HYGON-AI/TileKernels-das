@@ -23,7 +23,6 @@ def get_engram_grad_w_reduce_kernel(
     num_tiles = hidden_size // blk_d
     num_batches = 4
     assert num_persistent_blocks % num_batches == 0
-    num_rows = num_persistent_blocks // num_batches
 
     @T.prim_func
     def engram_grad_w_reduce_kernel(
@@ -36,7 +35,7 @@ def get_engram_grad_w_reduce_kernel(
         with T.Kernel(hc_mult, num_tiles, threads=threads) as (pid_h, pid_b):
             wh_fragment = T.alloc_fragment((blk_d,), T.float)
             we_fragment = T.alloc_fragment((blk_d,), T.float)
-            grad_w_shared = T.alloc_shared((num_rows, blk_d), T.float)
+            grad_w_row_shared = T.alloc_shared((1, blk_d), T.float)
             grad_w_fragment = T.alloc_fragment((blk_d,), T.float)
             grad_wh_fragment = T.alloc_fragment((blk_d,), T.float)
             grad_we_fragment = T.alloc_fragment((blk_d,), T.float)
@@ -47,12 +46,10 @@ def get_engram_grad_w_reduce_kernel(
             T.copy(grad_weight_hidden[pid_h, pid_b * blk_d : (pid_b + 1) * blk_d], grad_wh_fragment)
             T.copy(grad_weight_embed[pid_h, pid_b * blk_d : (pid_b + 1) * blk_d], grad_we_fragment)
 
-            for i_r in T.Pipelined(0, num_batches, num_stages=2):
-                T.copy(grad_w_partial[i_r * num_rows : (i_r + 1) * num_rows, pid_h, pid_b * blk_d : (pid_b + 1) * blk_d], grad_w_shared)
-
-                for i in T.Serial(num_rows):
-                    for j in T.Parallel(blk_d):
-                        grad_w_fragment[j] += grad_w_shared[i, j]
+            for i_r in T.Pipelined(0, num_persistent_blocks, num_stages=2):
+                T.copy(grad_w_partial[i_r, pid_h, pid_b * blk_d : (pid_b + 1) * blk_d], grad_w_row_shared[0, 0:blk_d])
+                for j in T.Parallel(blk_d):
+                    grad_w_fragment[j] += grad_w_row_shared[0, j]
 
             for j in T.Parallel(blk_d):
                 grad_wh_fragment[j] += grad_w_fragment[j] * we_fragment[j]
