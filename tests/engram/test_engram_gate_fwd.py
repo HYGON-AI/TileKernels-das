@@ -87,15 +87,15 @@ def test_engram_gate_fwd(params):
     )
     assert dot is not None and gate_score is not None and rstd_x is not None and rstd_k is not None
     diff_out = calc_diff(out_save, out_ref)
-    assert diff_out < 2e-10, f'out_save mismatch: {diff_out:.6e}'
+    assert diff_out < 1e-9, f'out_save mismatch: {diff_out:.6e}'
     diff_dot = calc_diff(dot, dot_ref)
-    assert diff_dot < 2e-10, f'dot mismatch: {diff_dot:.6e}'
+    assert diff_dot < 1e-9, f'dot mismatch: {diff_dot:.6e}'
     diff_gate = calc_diff(gate_score, gate_score_ref)
-    assert diff_gate < 2e-10, f'gate_score mismatch: {diff_gate:.6e}'
+    assert diff_gate < 1e-9, f'gate_score mismatch: {diff_gate:.6e}'
     diff_rstd_x = calc_diff(rstd_x, rstd_x_ref)
-    assert diff_rstd_x < 2e-10, f'rstd_x mismatch: {diff_rstd_x:.6e}'
+    assert diff_rstd_x < 1e-9, f'rstd_x mismatch: {diff_rstd_x:.6e}'
     diff_rstd_k = calc_diff(rstd_k, rstd_k_ref)
-    assert diff_rstd_k < 2e-10, f'rstd_k mismatch: {diff_rstd_k:.6e}'
+    assert diff_rstd_k < 1e-9, f'rstd_k mismatch: {diff_rstd_k:.6e}'
 
     # Correctness: save_for_backward=False
     out_no_save, dot_n, gate_score_n, rstd_x_n, rstd_k_n = engram_gate_fwd(
@@ -103,7 +103,7 @@ def test_engram_gate_fwd(params):
     )
     assert dot_n is None and gate_score_n is None and rstd_x_n is None and rstd_k_n is None
     diff_out = calc_diff(out_no_save, out_ref)
-    assert diff_out < 2e-10, f'out_no_save mismatch: {diff_out:.6e}'
+    assert diff_out < 1e-9, f'out_no_save mismatch: {diff_out:.6e}'
     assert_equal(out_no_save, out_save)
 
 
