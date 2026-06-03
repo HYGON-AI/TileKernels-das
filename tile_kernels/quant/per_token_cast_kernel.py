@@ -93,9 +93,13 @@ def get_per_token_cast_kernel(
                     k_idx = pid_hidden * block_k // in_config.sf_block[1] + j
                     x_sf_fragment[i, j] = transform_sf(load_sf(x_sf, m_idx, k_idx, in_config), in_config)
 
-                # Reduce stage 1, use half for reduction
+                # Reduce stage 1 in float32 so low-precision inputs do not distort the block max.
+                x_fragment_fp32 = T.alloc_fragment((block_m, block_k), T.float32)
+                for i, j in T.Parallel(block_m, block_k):
+                    x_fragment_fp32[i, j] = T.cast(x_fragment[i, j], T.float32)
+
                 stage1_amax_fragment = T.alloc_fragment((block_m, block_k // num_vectorize), T.float16)
-                x_stage1_fragment_reshaped = T.reshape(x_fragment, [block_m, block_k // num_vectorize, num_vectorize])
+                x_stage1_fragment_reshaped = T.reshape(x_fragment_fp32, [block_m, block_k // num_vectorize, num_vectorize])
                 T.reduce_absmax(x_stage1_fragment_reshaped, stage1_amax_fragment, dim=-1)
 
                 # Apply scaling factor

@@ -49,6 +49,7 @@ def generate_test_data(params):
 
 
 def generate_test_params(is_benchmark: bool) -> list[dict]:
+    is_hcu = torch.version.hip is not None
     params = [
         {
             'num_tokens': num_tokens,
@@ -69,6 +70,9 @@ def generate_test_params(is_benchmark: bool) -> list[dict]:
         for x_block_size in (((128, 128), (32, 32)) if in_dtype in (torch.float8_e4m3fn, torch.int8) else (None,))
         for fmt in ('e4m3', 'e2m1')
     ]
+    if is_hcu:
+        params = [p for p in params if p['in_dtype'] != torch.int8]
+        params = [p for p in params if p['fmt'] != 'e2m1']
     if is_benchmark:
         params = [p for p in params if p['use_packed_ue8m0']]
     return params
