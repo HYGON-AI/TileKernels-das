@@ -124,8 +124,12 @@ def expand_to_fused(x: torch.Tensor, token_topk_to_pos: torch.Tensor, pos_to_exp
         print(kernel.get_kernel_source())
 
     out = torch.empty((num_expanded_tokens, hidden), dtype=x.dtype, device='cuda')
+    # TileLang JIT adapter does not accept None tensor arguments.
+    # Provide shape-compatible placeholders for the sf inputs when sf is disabled.
+    x_sf_dummy = torch.empty((num_tokens, 1), dtype=x.dtype, device='cuda')
+    out_sf_dummy = torch.empty((num_expanded_tokens, 1), dtype=x.dtype, device='cuda')
     if num_tokens > 0:
-        kernel(x, None, out, None, token_topk_to_pos, pos_to_expert)
+        kernel(x, x_sf_dummy, out, out_sf_dummy, token_topk_to_pos, pos_to_expert)
 
     return out
 

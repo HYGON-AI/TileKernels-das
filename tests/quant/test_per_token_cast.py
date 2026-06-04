@@ -49,6 +49,7 @@ def generate_test_data(params):
 
 
 def generate_test_params(is_benchmark: bool) -> list[dict]:
+    is_hcu = torch.version.hip is not None
     params = [
         {
             'num_tokens': num_tokens,
@@ -69,6 +70,9 @@ def generate_test_params(is_benchmark: bool) -> list[dict]:
         for x_block_size in (((128, 128), (32, 32)) if in_dtype in (torch.float8_e4m3fn, torch.int8) else (None,))
         for fmt in ('e4m3', 'e2m1')
     ]
+    if is_hcu:
+        params = [p for p in params if p['in_dtype'] != torch.int8]
+        params = [p for p in params if p['fmt'] != 'e2m1']
     if is_benchmark:
         params = [p for p in params if p['use_packed_ue8m0']]
     return params
@@ -85,6 +89,10 @@ def test_per_token_cast(params):
     num_per_channels = params['num_per_channels']
     x_block_size = params.get('x_block_size')
     fmt = params['fmt']
+    is_hcu = torch.version.hip is not None
+
+    if fmt == 'e2m1' and is_hcu:
+        pytest.skip('Skip e2m1 per_token_cast on HCU')
 
     in_with_sf_factor = in_dtype in (torch.float8_e4m3fn, torch.int8)
     # Test correctness
@@ -146,6 +154,11 @@ def test_per_token_cast(params):
 def test_per_token_cast_benchmark(benchmark_timer, benchmark_record, params):
     in_dtype = params['in_dtype']
     num_per_channels = params['num_per_channels']
+    fmt = params['fmt']
+    is_hcu = torch.version.hip is not None
+
+    if fmt == 'e2m1' and is_hcu:
+        pytest.skip('Skip e2m1 per_token_cast benchmark on HCU')
 
     x, _, base_args, _ = generate_test_data(params)
     func = lambda: tile_kernels.quant.per_token_cast(

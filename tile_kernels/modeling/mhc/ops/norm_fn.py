@@ -163,7 +163,6 @@ class MHCPreNormFn(torch.autograd.Function):
             x_grad.view(-1, mhc_hidden_size),
             fn_grad,
         )
-
         if ctx.fuse_grad_acc:
             del x.untyped_storage().grad_from_mhc_post
             return None, fn_grad, None, None, None, None

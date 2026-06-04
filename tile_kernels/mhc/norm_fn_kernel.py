@@ -226,7 +226,7 @@ def _mhc_pre_norm_fn_bwd_mul(
     mhc_mult3: int,
     n_rms_group: int,
     rms_group_size: int,
-    token_block: int = 128,
+    token_block: int = 64,
     hidden_block: int = 128,
 ) -> tilelang.JITKernel:
     assert mhc_mult3 <= 32
@@ -279,6 +279,7 @@ def _mhc_pre_norm_fn_bwd_mul(
                     transpose_A=True,
                     transpose_B=False,
                     clear_accum=False,
+                    use_tf32=True,
                 )
                 T.gemm(
                     padded_grad,
@@ -287,6 +288,7 @@ def _mhc_pre_norm_fn_bwd_mul(
                     transpose_A=False,
                     transpose_B=False,
                     clear_accum=False,
+                    use_tf32=True,
                 )
 
                 sqrsum_grad_frag = T.alloc_fragment((token_block, 1), T.float32)

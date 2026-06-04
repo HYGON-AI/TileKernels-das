@@ -197,6 +197,13 @@ def per_channel_cast_fused(
 
     out = torch.empty((num_tokens_out, hidden), dtype=out_config.torch_dtype, device='cuda')
     out_sf = torch.empty((ceil_div(num_tokens_out, num_per_tokens), hidden), dtype=torch.float32, device='cuda')
+    # TileLang JIT adapter does not accept None tensor arguments. Provide
+    # shape-compatible placeholders so symbolic dimension constraints remain
+    # consistent across all arguments.
+    if x_sf_invs is None:
+        x_sf_invs = torch.empty((num_tokens, hidden), dtype=torch.float32, device='cuda')
+    if pos_to_token is None:
+        pos_to_token = torch.empty((num_tokens_out,), dtype=torch.int32, device='cuda')
     if num_tokens_out > 0:
         kernel(x, out, out_sf, x_sf_invs, pos_to_token)
 
