@@ -19,6 +19,26 @@ from tile_kernels.engram.engram_gate_bwd_reload_helpers import (
 )
 
 
+def _get_positive_env_int(name: str) -> Optional[int]:
+    value = os.environ.get(name)
+    if value in (None, ''):
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f'{name} must be positive, got {parsed}')
+    return parsed
+
+
+def _get_nonnegative_env_int(name: str) -> Optional[int]:
+    value = os.environ.get(name)
+    if value in (None, ''):
+        return None
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError(f'{name} must be non-negative, got {parsed}')
+    return parsed
+
+
 def _choose_engram_fwd_threads_vec_size(blk_d: int) -> tuple[int, int]:
     """CUDA warp32 vs HIP wave64; choose vec_size so ``blk_d % (threads * vec_size) == 0``.
 
@@ -632,10 +652,9 @@ def get_engram_gate_bwd_reload_kernel(
                 T.clear(dldg_local)
 
                 # Pass 1: ping-pong grad_out + v — dldg and grad_v per slice
-                # First slice prologue (slice 0 prefetched at end of previous token's Pass1).
-                if i_s == t_start:
-                    T.async_copy(grad_out[i_s, :, 0:h_blk1], go_bb[0, :, :], loop_layout=go_copy_layout)
-                    T.async_copy(v[i_s, 0:h_blk1], v_bb[0, :])
+                # prologue
+                T.async_copy(grad_out[i_s, :, 0:h_blk1], go_bb[0, :, :], loop_layout=go_copy_layout)
+                T.async_copy(v[i_s, 0:h_blk1], v_bb[0, :])
 
                 for i_sl in T.serial(1, num_slices1):
                     phase = i_sl % 2
@@ -782,14 +801,6 @@ def get_engram_gate_bwd_reload_kernel(
 
                 T.ptx_wait_group(0)
                 # T.sync_threads()
-                # Prefetch next token's Pass1 slice 0 while Pass2 runs (go_bb/v_bb idle until next i_s).
-                if i_s + 1 < t_end:
-                    T.async_copy(
-                        grad_out[i_s + 1, :, 0:h_blk1],
-                        go_bb[0, :, :],
-                        loop_layout=go_copy_layout,
-                    )
-                    T.async_copy(v[i_s + 1, 0:h_blk1], v_bb[0, :])
 
                 last_phase2 = (num_slices2 - 1) % 2
                 slice_lo2 = (num_slices2 - 1) * h_blk2
