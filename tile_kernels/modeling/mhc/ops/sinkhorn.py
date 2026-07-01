@@ -1,6 +1,10 @@
 import torch
 
-from tile_kernels.mhc.sinkhorn_kernel import _mhc_sinkhorn_bwd, _mhc_sinkhorn_fwd
+from tile_kernels.mhc.sinkhorn_kernel import (
+    _mhc_sinkhorn_bwd,
+    _mhc_sinkhorn_bwd_repeat,
+    _mhc_sinkhorn_fwd,
+)
 
 
 class _SinkhornNormalize(torch.autograd.Function):
@@ -14,7 +18,10 @@ class _SinkhornNormalize(torch.autograd.Function):
         hidden_size = x.shape[1]
         output = torch.empty_like(x)
         fwd_kernel = _mhc_sinkhorn_fwd(hidden_size, 1, repeat, eps)
-        bwd_kernel = _mhc_sinkhorn_bwd(hidden_size, 32, repeat, eps)
+        if repeat > 10:
+            bwd_kernel = _mhc_sinkhorn_bwd_repeat(hidden_size, 32, repeat, eps)
+        else:
+            bwd_kernel = _mhc_sinkhorn_bwd(hidden_size, 32, repeat, eps)
         ctx.save_for_backward(x)
         ctx.bwd_kernel = bwd_kernel
         fwd_kernel(x, output)

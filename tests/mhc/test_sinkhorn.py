@@ -7,7 +7,7 @@ from tile_kernels.torch.mhc import sinkhorn_normalize_ref
 
 
 def generate_sinkhorn_test_data(
-    n0: int, n1: int, mhc: int, device: str = 'cuda'
+    n0: int, n1: int, mhc: int, repeat: int, device: str = 'cuda'
 ) -> dict[str, torch.Tensor]:
     comb_res_mix = torch.randn((n0, n1, mhc, mhc), dtype=torch.float32, device=device)
     out_grad = torch.randn((n0, n1, mhc, mhc), dtype=torch.float32, device=device)
@@ -15,7 +15,7 @@ def generate_sinkhorn_test_data(
     return {
         'comb_res_mix': comb_res_mix,
         'out_grad': out_grad,
-        'repeat': 10,
+        'repeat': repeat,
         'eps': 1e-6,
     }
 
@@ -33,8 +33,9 @@ def _tester(
 @pytest.mark.parametrize('n0', [1, 2])
 @pytest.mark.parametrize('n1', [1, 1024, 4096])
 @pytest.mark.parametrize('mhc', [4])
-def test_sinkhorn_comprehensive(n0: int, n1: int, mhc: int) -> None:
-    test_data = generate_sinkhorn_test_data(n0=n0, n1=n1, mhc=mhc)
+@pytest.mark.parametrize('repeat', [10, 20])
+def test_sinkhorn_comprehensive(n0: int, n1: int, mhc: int, repeat: int) -> None:
+    test_data = generate_sinkhorn_test_data(n0=n0, n1=n1, mhc=mhc, repeat=repeat)
 
     out_tl, grad_tl = _tester(sinkhorn_normalize, test_data)
     out_ref, grad_ref = _tester(sinkhorn_normalize_ref, test_data)
