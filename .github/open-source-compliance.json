@@ -1,0 +1,8 @@
+{
+  "project": "TileKernels-hygon",
+  "upstream_repo": "https://github.com/deepseek-ai/TileKernels.git",
+  "upstream_branch": "main",
+  "target_branch": "staging",
+  "license": "MIT",
+  "company": "Hygon Information Technology Co., Ltd."
+}
