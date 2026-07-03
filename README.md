@@ -1,6 +1,6 @@
 # Tile Kernels
 
-Optimized GPU kernels for LLM operations, built with [TileLang](https://github.com/tile-ai/tilelang). TileLang is a domain-specific language for expressing high-performance GPU kernels in Python, featuring easy migration, agile development, and automatic optimization.
+Optimized GPU kernels for LLM operations, built with [tilelang-hygon](https://github.com/tile-ai/tilelang-hygon). TileLang is a domain-specific language for expressing high-performance GPU kernels in Python, featuring easy migration, agile development, and automatic optimization.
 
 Most kernels in this project approach the limit of hardware performance regarding the compute intensity and memory bandwidth. Some of them have already been used in internal training and inference scenarios. However, they do not represent best practices and we are actively working on improving the code quality and documentation.
 
@@ -19,8 +19,7 @@ Most kernels in this project approach the limit of hardware performance regardin
 - Python 3.10 or higher
 - PyTorch 2.10 or higher
 - TileLang 0.1.9 or higher
-- NVIDIA SM90 or SM100 architecture GPU
-- CUDA Toolkit 13.1 or higher
+- Hygon DCU-2G or DCU-3G
 
 ## Installation
 
