@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+#
+# SPDX-License-Identifier: MIT
+
 """
 mhc_pre_big_fuse 性能基准：
   - 主计时默认 CUDA Graph：capture + replay（降低 Python/host launch 开销；PyTorch 可将图中 cudaMalloc 等纳入捕获，未必依赖改源码）。

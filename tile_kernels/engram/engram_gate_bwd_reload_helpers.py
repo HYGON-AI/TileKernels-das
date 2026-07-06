@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+#
+# SPDX-License-Identifier: MIT
+
 """Helpers for estimating engram_gate_bwd SMEM and choosing tiling for the reload (low-LDS) backward kernel."""
 
 import functools

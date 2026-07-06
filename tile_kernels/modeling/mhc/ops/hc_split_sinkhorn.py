@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+#
+# SPDX-License-Identifier: MIT
+
 import torch
 
 from tile_kernels.mhc.hc_split_sinkhorn_kernel import mhc_split_sinkhorn

@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+#
+# SPDX-License-Identifier: MIT
+
 import functools
 from typing import Tuple
 
@@ -143,4 +147,3 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
         mhc_pre_gemm_sqrsum_splitk_stage_0,
         mhc_pre_gemm_sqrsum_splitk_stage_1,
     )
-
