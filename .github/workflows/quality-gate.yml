@@ -331,7 +331,6 @@ jobs:
     if: needs.changed-files.outputs.has_files == 'true'
     runs-on: [self-hosted, Linux, X64, internal, quality]
     timeout-minutes: 10
-    continue-on-error: true
 
     steps:
       - name: Checkout
