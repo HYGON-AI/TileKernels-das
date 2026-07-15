@@ -31,8 +31,10 @@ def get_max_smem_per_sm() -> int:
 
     gcn_arch_name = getattr(prop, 'gcnArchName', None)
     gcn_arch_base = gcn_arch_name.split(':', 1)[0] if isinstance(gcn_arch_name, str) else None
-    if gcn_arch_base in {'gfx936', 'gfx938'}:
+    if gcn_arch_base in {'gfx936', 'gfx938', 'gfx92a'}:
         return 64 * 1024
+    if gcn_arch_base == 'gfx946':
+        return 128 * 1024
 
     raise AttributeError(
         'Unable to determine max shared memory per SM: missing '
