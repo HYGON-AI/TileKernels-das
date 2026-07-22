@@ -692,6 +692,7 @@ def get_engram_gate_bwd_reload_kernel(
                         for i_k in T.vectorized(v_vec_size):
                             gidx = slice_lo + jj * threads * v_vec_size + tid * v_vec_size + i_k
                             grad_v[i_s, gidx] = grad_v_partial[i_k]
+                    T.sync_warp()
 
                 T.ptx_wait_group(0)
                 T.sync_threads()

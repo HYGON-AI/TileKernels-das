@@ -3,15 +3,15 @@ from typing import Optional, Union
 
 import torch
 from tilelang import language as T
-from tilelang.contrib import nvcc
-from tilelang.utils.target import determine_target
+# from tilelang.contrib import nvcc
+# from tilelang.utils.target import determine_target
 
 from tile_kernels.quant.types import QuantTensor
 from tile_kernels.utils import align, ceil_div
 
 
 def get_best_vectorize_size(dtype: T.dtype) -> int:
-    target = determine_target(return_object=True)
+    # target = determine_target(return_object=True)
     # ver = nvcc.get_target_compute_version(target)  # e.g. "8.6"
     # major, _ = nvcc.parse_compute_version(ver)
     # return (16 if major < 10 else 32) // dtype.bytes
