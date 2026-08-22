@@ -26,8 +26,9 @@ def get_num_sms() -> int:
 @functools.lru_cache(maxsize=None)
 def get_max_smem_per_sm() -> int:
     prop = torch.cuda.get_device_properties(torch.cuda.current_device())
-    if hasattr(prop, 'shared_memory_per_multiprocessor'):
-        return prop.shared_memory_per_multiprocessor
+    # NOTE: this prop seems not correct in hcu env
+    # if hasattr(prop, 'shared_memory_per_multiprocessor'):
+    #     return prop.shared_memory_per_multiprocessor
 
     gcn_arch_name = getattr(prop, 'gcnArchName', None)
     gcn_arch_base = gcn_arch_name.split(':', 1)[0] if isinstance(gcn_arch_name, str) else None
