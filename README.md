@@ -18,7 +18,7 @@ Most kernels in this project approach the limit of hardware performance regardin
 
 - Python 3.10 or higher
 - PyTorch 2.10 or higher
-- TileLang 0.1.9 or higher
+- TileLang 1.12.0 or higher
 - Hygon DCU-2G or DCU-3G
 
 ## Installation
@@ -72,7 +72,19 @@ This project is built on [TileLang](https://github.com/tile-ai/tilelang). Thanks
 
 ## License
 
-This code repository is released under [the MIT License](LICENSE).
+This repository is based on the following fixed upstream baseline:
+
+- Upstream project: TileKernels
+- Upstream repository: https://github.com/deepseek-ai/TileKernels
+- Upstream branch: `main`
+- Upstream Commit: [`36d9e45d38e204ebb87e6f6e833821eee0482fe5`](https://github.com/deepseek-ai/TileKernels/commit/36d9e45d38e204ebb87e6f6e833821eee0482fe5)
+- Upstream license: [MIT License](https://github.com/deepseek-ai/TileKernels/blob/main/LICENSE)
+
+Hygon adaptations, modifications, and original contributions are licensed under the MIT License.
+
+Modified by Hygon Information Technology Co., Ltd.
+
+Original copyright notices and license terms from the upstream TileKernels project are retained. See [LICENSE](LICENSE) and [Third-Party Notices](THIRD_PARTY_NOTICES.md) for details.
 
 ## Citation
 
