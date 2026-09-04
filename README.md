@@ -19,7 +19,7 @@ Most kernels in this project approach the limit of hardware performance regardin
 - Python 3.10 or higher
 - PyTorch 2.10 or higher
 - TileLang 1.12.0 or higher
-- Hygon DCU-2G or DCU-3G
+- HYGON BW1000, BW1100, BW150, or K100_AI (DTK software stack required)
 
 ## Installation
 
