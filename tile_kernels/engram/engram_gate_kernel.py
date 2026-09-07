@@ -145,7 +145,7 @@ def get_engram_gate_fwd_kernel(
                     prev_phase = (i_b - 1) % 2
                     T.async_copy(hidden_states[i_s, pid_h, i_b * blk_d:(i_b + 1) * blk_d], x_smem[i_b * blk_d:(i_b + 1) * blk_d])
                     T.async_copy(k[i_s, pid_h, i_b * blk_d:(i_b + 1) * blk_d], kv_smem[phase, :])
-                    T.ptx_wait_group(2 * sub_blks)
+                    T.ptx_wait_group(2)
                     for i_sub in T.Serial(sub_blks):
                         sub_base = (i_b - 1) * blk_d + i_sub * reduce_blk
                         for i_k in T.vectorized(vec_size):
@@ -204,7 +204,7 @@ def get_engram_gate_fwd_kernel(
                 for i_b in T.Serial(num_blk):
                     tile_phase = (v_start_phase + i_b) % 2
                     if i_b < num_blk - 1:
-                        T.ptx_wait_group(sub_blks)
+                        T.ptx_wait_group(1)
                     else:
                         T.ptx_wait_group(0)
                         # Prefetch next token's k and x
@@ -378,7 +378,7 @@ def get_engram_gate_bwd_kernel(
                 if i_s == t_start:
                     T.async_copy(v[i_s, :], v_smem)
                     T.async_copy(grad_out[i_s, :, :go_blk_d], go_smem[:, :go_blk_d], loop_layout=go_copy_layout)
-                    T.ptx_wait_group(go_sub_blks)
+                    T.ptx_wait_group(1)
                     # ensure v_smem is readable by all threads
                     T.sync_threads()
 
@@ -398,7 +398,7 @@ def get_engram_gate_bwd_kernel(
                     T.async_copy(grad_out[i_s, :, i_b * go_blk_d:(i_b + 1) * go_blk_d],
                                  go_smem[:, i_b * go_blk_d:(i_b + 1) * go_blk_d],
                                  loop_layout=go_copy_layout)
-                    T.ptx_wait_group(go_sub_blks)
+                    T.ptx_wait_group(1)
                     for i_sub in T.serial(go_sub_blks):
                         go_base = (i_b - 1) * go_blk_d + i_sub * threads_per_head * go_vec_size + sub_warp_id * warp_size * go_vec_size
                         for i_k in T.vectorized(go_vec_size):
@@ -470,7 +470,7 @@ def get_engram_gate_bwd_kernel(
                     T.async_copy(weight_fused[:, i_b * x_blk_d:(i_b + 1) * x_blk_d],
                                  w_smem[phase, :, :], loop_layout=x_copy_layout)
 
-                    T.ptx_wait_group(3 * x_sub_blks)
+                    T.ptx_wait_group(3)
 
                     for i_sub in T.unroll(x_sub_blks):
                         sub_off = i_sub * (threads_per_head * x_vec_size) + sub_warp_id * (warp_size * x_vec_size)

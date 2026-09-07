@@ -151,23 +151,21 @@ def reload_pass1_prefetch_wait_groups(
 ) -> int:
     """``ptx_wait_group(N)`` for one Pass1 ``go_bb + v_bb`` prefetch batch (HCU).
 
-    ``go`` (Fragment, ``go_vec``) lowers to ``go_sub`` × ``cp_async_gs<go_vec*2>``.
-    ``v`` (flat) lowers to one ``cp_async_gs<v_vec*2>`` per slice (``v_groups``).
+    Each ``T.async_copy`` forms one async group, regardless of how many
+    ``cp_async_gs`` instructions it lowers to.
     """
 
-    go_sub = h_blk1 // (threads_per_head * go_vec_size)
-    v_groups = h_blk1 // (threads * v_vec_size)
-    return go_sub + v_groups
+    return 2
 
 
 def reload_pass2_prefetch_wait_groups(x_sub_blks: int) -> int:
     """``ptx_wait_group(N)`` for one Pass2 ``go2/xh/kh/wf`` prefetch batch (HCU).
 
-    Four buffers; each ``T.async_copy`` lowers to ``x_sub_blks`` async ops
-    (``go2/xh/kh`` → ``cp_async_gs<8>``, ``wf_bb`` fp32 → ``cp_async_gs<16>``).
+    Four buffers form four async groups. The number of instructions within
+    each group does not affect ``ptx_wait_group`` depth.
     """
 
-    return 4 * x_sub_blks
+    return 4
 
 
 @functools.lru_cache(maxsize=None)
