@@ -9,6 +9,7 @@ _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
     tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
+    tilelang.PassConfigKey.TL_DEVICE_COMPILE_FLAGS: ["-ffp-contract=off"],
 }
 
 
