@@ -56,6 +56,7 @@ def _choose_engram_fwd_threads_vec_size(blk_d: int) -> tuple[int, int]:
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+        tilelang.PassConfigKey.TL_DEVICE_COMPILE_FLAGS: ["-fno-slp-vectorize"],
     },
 )
 def get_engram_gate_fwd_kernel(
