@@ -1,7 +1,5 @@
 import torch
 
-from tile_kernels.mhc.norm_fn_kernel import round_to_tf32
-
 
 def expand_to_mhc_ref(hidden: torch.Tensor, mhc_mult: int) -> torch.Tensor:
     return hidden.unsqueeze(-2).expand(*hidden.shape[:-1], mhc_mult, hidden.shape[-1]).contiguous()
@@ -87,8 +85,14 @@ def mhc_pre_norm_fn_ref(
     return mixes.view(*residual.shape[:2], -1)
 
 
+def _quantize_tf32(x: torch.Tensor) -> torch.Tensor:
+    """Round FP32 values to the TF32 input format in software."""
+    bits = x.contiguous().view(torch.int32)
+    return ((bits + 0x1000).bitwise_and(-0x2000)).view(torch.float32)
+
+
 class _MHCPreNormFnRefTLAlign(torch.autograd.Function):
-    """Reference with the same TF32 round points as TileLang MHCPreNormFn."""
+    """Reference with software TF32 inputs matching TileLang MHCPreNormFn."""
 
     @staticmethod
     def forward(
@@ -97,7 +101,7 @@ class _MHCPreNormFnRefTLAlign(torch.autograd.Function):
         mhc_fn: torch.Tensor,
         mhc_norm_eps: float,
     ) -> torch.Tensor:
-        mhc_fn = round_to_tf32(mhc_fn)
+        mhc_fn = _quantize_tf32(mhc_fn)
 
         mhc_mult3, rms_group_size = mhc_fn.shape
         x = residual.flatten(2, 3).float().reshape(-1, rms_group_size)
@@ -107,7 +111,12 @@ class _MHCPreNormFnRefTLAlign(torch.autograd.Function):
         x_grouped = x.view(num_tokens, n_rms_group, rms_group_size)
         fn_grouped = mhc_fn.view(mhc_mult3, n_rms_group, rms_group_size)
 
-        out_mul = torch.einsum('mbk,nbk->mbn', x_grouped, fn_grouped)
+        allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            out_mul = torch.einsum('mbk,nbk->mbn', x_grouped, fn_grouped)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
         sqrsum = x_grouped.square().sum(-1)
 
         rms = (sqrsum / rms_group_size + mhc_norm_eps).rsqrt()
@@ -139,12 +148,15 @@ class _MHCPreNormFnRefTLAlign(torch.autograd.Function):
         rms_grad = (out_grad * out_mul.squeeze(1)).sum(-1, keepdim=True)
         sqrsum_grad = rms_grad * rms / (sqrsum + mhc_norm_eps * rms_group_size) / -2
 
-        out_mul_grad = round_to_tf32(out_mul_grad.unsqueeze(1))
+        out_mul_grad = _quantize_tf32(out_mul_grad.unsqueeze(1))
 
-        torch.backends.cuda.matmul.allow_tf32 = True
-        fn_grad = out_mul_grad.squeeze(1).T @ x
-        x_grad = out_mul_grad.squeeze(1) @ mhc_fn
+        allow_tf32 = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            fn_grad = out_mul_grad.squeeze(1).T @ x
+            x_grad = out_mul_grad.squeeze(1) @ mhc_fn
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
 
         x_grad = x_grad + 2 * x * sqrsum_grad
         residual_grad = x_grad.reshape(ctx.residual_shape).to(ctx.residual_dtype)
