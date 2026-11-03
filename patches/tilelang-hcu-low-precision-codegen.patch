@@ -1,0 +1,713 @@
+--- a/src/hcu/codegen/codegen_hcu.cc
++++ b/src/hcu/codegen/codegen_hcu.cc
+@@ -17,6 +17,7 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdint>
++#include <iomanip>
+ #include <optional>
+ #include <string>
+ #include <unordered_map>
+@@ -323,7 +324,7 @@
+   case 16:
+     return {lanes, "int2"};
+   case 32:
+-    return {lanes, "tl::uint8x16_t"};
++    return {lanes, "int4"};
+   default:
+     LOG(FATAL) << "HCU fp4 packed vector load/store only supports lanes 2, "
+                   "4, 8, 16, or 32; got lanes="
+@@ -909,6 +910,9 @@
+   if (enable_fp8_) {
+     decl_stream << "#include <tl_templates/hcu/hcu_fp8.h>\n";
+   }
++  if (enable_stochastic_round_) {
++    decl_stream << "#include <tl_templates/hcu/stochastic_round.h>\n";
++  }
+ 
+   decl_stream << "#include <tl_templates/hcu/atomic.h>\n";
+   if (enable_gemm_mls_) {
+@@ -1969,6 +1973,8 @@
+     ICHECK(scope == "shared" || scope == "shared.dyn" || scope == "local" ||
+            scope == "local.var")
+         << "Unexpected packed fp4 store scope: " << scope;
++    // PrintExpr may emit temporary declarations before returning its value.
++    std::string value = PrintExpr(op->value);
+     std::string pred = GetCurrentPredicate();
+     PrintIndent();
+     if (pred != "true")
+@@ -1976,7 +1982,7 @@
+     stream << "*(reinterpret_cast<" << fp4_desc.c_type << "*>("
+            << GetVarID(op->buffer->data.get()) << ") + (("
+            << PrintExpr(ramp->base) << ") / " << fp4_desc.lanes
+-           << ")) = " << PrintExpr(op->value) << ";\n";
++           << ")) = " << value << ";\n";
+     return;
+   }
+ 
+@@ -2024,7 +2030,19 @@
+ void CodeGenTileLangHCU::VisitExpr_(const BufferLoadNode *op,
+                                     std::ostream &os) {
+   DataType value_dtype = op->dtype;
+-  if (!value_dtype.is_float4_e2m1fn() || value_dtype.lanes() == 1) {
++  if (value_dtype.is_float4_e2m1fn() && value_dtype.is_scalar()) {
++    ICHECK_EQ(op->indices.size(), 1);
++    ICHECK(!op->predicate.defined());
++    PrimExpr index = op->indices[0];
++    std::string byte_index = PrintExpr(floordiv(index, Integer(2)));
++    std::string shift = PrintExpr(floormod(index, Integer(2)) * Integer(4));
++    // A scalar FP4 value is one nibble, while its storage type holds a pair.
++    os << "tl::pk_fp4_t(static_cast<uint8_t>((reinterpret_cast<const uint8_t*>("
++       << GetVarID(op->buffer->data.get()) << ")[" << byte_index << "] >> ("
++       << shift << ")) & 0xF))";
++    return;
++  }
++  if (!value_dtype.is_float4_e2m1fn()) {
+     CodeGenC::VisitExpr_(op, os);
+     return;
+   }
+@@ -2071,6 +2089,10 @@
+ 
+ void CodeGenTileLangHCU::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
+   int lanes = t.lanes();
++  if ((t.is_int() || t.is_uint()) && t.bits() == 64 && lanes == 8) {
++    os << "tl::array<" << (t.is_uint() ? "uint64_t" : "int64_t") << ", 8>";
++    return;
++  }
+   if (t.is_handle()) {
+     ICHECK(t.is_scalar()) << "do not yet support vector types";
+     os << "void*";
+@@ -2180,7 +2202,7 @@
+       os << "int2";
+       return;
+     } else if (t.lanes() == 32) {
+-      os << "tl::uint8x16_t";
++      os << "int4";
+       return;
+     }
+     fail = true;
+@@ -2193,6 +2215,9 @@
+     int n = t.lanes();
+     if (n <= 4) {
+       os << "ushort" << n;
++      return;
++    } else if (n == 8 || n == 16 || n == 32) {
++      os << "tl::uint8x" << n << "_t";
+       return;
+     }
+   } else if (t.is_uint() || t.is_int()) {
+@@ -2538,13 +2563,18 @@
+   }
+ 
+   static const char access[] = {'x', 'y', 'z', 'w'};
+-  ICHECK(i >= 0 && i < (t.bits() == 8                        ? 16
+-                        : t.is_float4_e2m1fn()               ? 16
++  ICHECK(i >= 0 && i < (t.bits() == 64 && t.lanes() == 8    ? 8
++                        : t.is_vector_bool()                 ? t.lanes()
++                        : t.bits() == 8                       ? 16
++                        : t.is_float4_e2m1fn()               ? 32
+                         : (t.lanes() == 16)                  ? 16
+                         : (t.lanes() == 32)                  ? 32
+                         : (t.bits() == 16 || t.bits() == 32) ? 8
+                                                              : 4));
+-  if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
++  if ((t.is_vector_bool() && t.lanes() > 4) ||
++      (t.bits() == 64 && t.lanes() == 8)) {
++    os << vec << "[" << i << "]";
++  } else if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
+     std::string type_name = t.is_int() ? "char" : "unsigned char";
+     if (t.lanes() == 2 || t.lanes() == 3) {
+       os << vec << "." << access[i % t.lanes()];
+@@ -2552,6 +2582,8 @@
+       std::string ac = t.lanes() == 4 ? vec : (vec + "." + access[i / 4]);
+       os << "((" << type_name << ")(" << ac << " >> " << i % 4 * 8 << "))";
+     }
++  } else if (t.is_float8()) {
++    os << vec << "[" << i << "]";
+   } else if ((t.lanes() == 16 || t.lanes() == 32) && t.bits() == 32 &&
+              t.is_float()) {
+     os << vec << "[" << i << "]";
+@@ -2591,7 +2623,7 @@
+         type_name = "float";
+       }
+     }
+-    ICHECK(!type_name.empty());
++    ICHECK(!type_name.empty()) << "Unsupported vector element type: " << t;
+     os << "((" << type_name << "2*)(&(" << vec << "." << access[i / 2]
+        << ")))->" << access[i % 2];
+   } else {
+@@ -2603,13 +2635,18 @@
+                                            int i, const std::string &value) {
+   this->PrintIndent();
+   static const char access[] = {'x', 'y', 'z', 'w'};
+-  ICHECK(i >= 0 && i < (t.bits() == 8                        ? 16
+-                        : t.is_float4_e2m1fn()               ? 16
++  ICHECK(i >= 0 && i < (t.bits() == 64 && t.lanes() == 8    ? 8
++                        : t.is_vector_bool()                 ? t.lanes()
++                        : t.bits() == 8                       ? 16
++                        : t.is_float4_e2m1fn()               ? 32
+                         : (t.lanes() == 16)                  ? 16
+                         : (t.lanes() == 32)                  ? 32
+                         : (t.bits() == 16 || t.bits() == 32) ? 8
+                                                              : 4));
+-  if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
++  if ((t.is_vector_bool() && t.lanes() > 4) ||
++      (t.bits() == 64 && t.lanes() == 8)) {
++    stream << vec << "[" << i << "] = " << value << ";\n";
++  } else if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
+     if (t.lanes() == 2 || t.lanes() == 3) {
+       stream << vec << '.' << access[i % t.lanes()] << "="
+              << "(" << value << ");\n";
+@@ -2622,6 +2659,8 @@
+       }
+       stream << "(" << value << " << " << i % 4 * 8 << ");\n";
+     }
++  } else if (t.is_float8()) {
++    stream << vec << "[" << i << "] = " << value << ";\n";
+   } else if ((t.lanes() == 16 || t.lanes() == 32) && t.bits() == 32 &&
+              t.is_float()) {
+     stream << vec << "[" << i << "] = " << value << ";\n";
+@@ -2638,12 +2677,14 @@
+     std::string mask = "0xF";
+     std::string dst =
+         (t.lanes() <= 8) ? vec : (vec + "." + std::string(1, access[i / 8]));
+-    if (i == 0) {
+-      stream << dst << " = ((" << value << " & " << mask << ") << "
++    if (i % 8 == 0) {
++      stream << dst << " = ((static_cast<uint8_t>(" << value << ") & "
++             << mask << ") << "
+              << nibble_shift << ");\n";
+     } else {
+       stream << dst << " = (" << dst << " & ~(" << mask << " << "
+-             << nibble_shift << ")) | ((" << value << " & " << mask << ") << "
++             << nibble_shift << ")) | ((static_cast<uint8_t>(" << value
++             << ") & " << mask << ") << "
+              << nibble_shift << ");\n";
+     }
+   } else if (t.lanes() > 4 && t.lanes() <= 8) {
+@@ -2663,7 +2704,7 @@
+         type_name = "float";
+       }
+     }
+-    ICHECK(!type_name.empty());
++    ICHECK(!type_name.empty()) << "Unsupported vector element type: " << t;
+     stream << "((" << type_name << "2*)(&(" << vec << "." << access[i / 2]
+            << ")))->" << access[i % 2] << " = " << value << ";\n";
+   } else {
+@@ -2742,11 +2783,27 @@
+                                            DataType target) {
+   if (from == target)
+     return value;
++  if ((from.is_bfloat16() || from.is_float16()) &&
++      NeedsFp8NumericCvt(from, target))
++    return CastFromTo("static_cast<float>(" + value + ")", DataType::Float(32),
++                      target);
++  if ((target.is_bfloat16() || target.is_float16()) &&
++      NeedsFp8NumericCvt(from, target))
++    return CastFromTo(CastFromTo(value, from, DataType::Float(32)),
++                      DataType::Float(32), target);
+   std::ostringstream os;
+   os << "((";
+   this->PrintType(target, os);
+   os << ")";
+-  if (from.is_float16() && (target.is_int() || target.is_uint()) &&
++  if (from.is_float4_e2m1fn()) {
++    os << "static_cast<float>(tl::pk_fp4_t(static_cast<uint8_t>(" << value
++       << "))))";
++    return os.str();
++  } else if (target.is_float4_e2m1fn()) {
++    // The packed type's integer constructor preserves raw bits; numeric casts
++    // must select its float constructor, including BF16 inputs.
++    os << "(float)";
++  } else if (from.is_float16() && (target.is_int() || target.is_uint()) &&
+       target.bits() == 8) {
+     os << "(";
+     if (target.is_uint()) {
+@@ -2765,18 +2822,60 @@
+   DataType target_ty = op->dtype;
+   ICHECK_EQ(target_ty.lanes(), from_ty.lanes());
+ 
++  auto rounding = op->annotations.find("round");
++  bool stochastic = rounding != op->annotations.end() &&
++                    Downcast<StringImm>((*rounding).second)->value == "rs";
++  std::string random_bits;
++  int mantissa = 0;
++  if (stochastic) {
++    ICHECK(from_ty.is_float() && from_ty.bits() == 32)
++        << "HCU stochastic casts require FP32 inputs";
++    auto random = op->annotations.find("rbits");
++    ICHECK(random != op->annotations.end()) << "Stochastic casts require rbits";
++    PrimExpr expression = Downcast<PrimExpr>((*random).second);
++    ICHECK(expression.dtype().is_scalar() && expression.dtype().bits() == 32);
++    random_bits = PrintExpr(expression);
++    auto saturation = op->annotations.find("sat");
++    ICHECK(saturation == op->annotations.end() ||
++           Downcast<IntImm>((*saturation).second)->value != 0)
++        << "HCU stochastic casts require sat=true";
++    if (target_ty.is_bfloat16())
++      mantissa = 7;
++    else if (target_ty.is_float8_e4m3fn() || target_ty.is_float8_e4m3())
++      mantissa = 3;
++    else if (target_ty.is_float4_e2m1fn())
++      mantissa = 1;
++    ICHECK_NE(mantissa, 0)
++        << "HCU stochastic casts support BF16, E4M3FN and E2M1";
++    enable_stochastic_round_ = true;
++  }
++  auto stochastic_value = [&](const std::string &value, int lane) {
++    std::string rounded = "tl::stochastic_round_to_float32<" +
++                          std::to_string(mantissa) + ">(" + value +
++                          ", static_cast<uint32_t>(" + random_bits + "), " +
++                          std::to_string(lane) + ")";
++    if (target_ty.is_bfloat16()) {
++      // Preserve BF16 subnormal bits without a floating conversion that may FTZ.
++      return "__builtin_bit_cast(bfloat16_t, static_cast<uint16_t>("
++             "tl::bit_cast<uint32_t>(" + rounded + ") >> 16))";
++    }
++    return CastFromTo(rounded, DataType::Float(32), target_ty.element_of());
++  };
++
+   if (from_ty.is_scalar()) {
+-    // Non-fp8: plain C cast. fp8: CastFromTo inserts fp8_cvt_t/bf8_cvt_t.
+-    if (!NeedsFp8NumericCvt(from_ty, target_ty))
++    if (stochastic) {
++      os << stochastic_value(PrintExpr(op->value), 0);
++      return;
++    }
++    // Packed low-precision storage needs a numeric conversion wrapper.
++    if (!NeedsFp8NumericCvt(from_ty, target_ty) &&
++        !from_ty.is_float4_e2m1fn() && !target_ty.is_float4_e2m1fn())
+       return CodeGenC::VisitExpr_(op, os);
+     os << CastFromTo(PrintExpr(op->value), from_ty, target_ty);
+     return;
+   }
+ 
+   // Emit vector casts as per-lane unary ops (readable vs make_* packs).
+-  const char *type_cvt = NeedsFp8NumericCvt(from_ty, target_ty)
+-                             ? Fp8NumericCvtCast(from_ty, target_ty)
+-                             : "";
+   std::string sret = name_supply_->FreshName("_");
+   this->PrintIndent();
+   this->PrintType(target_ty, stream);
+@@ -2784,13 +2883,12 @@
+   {
+     std::string src = SSAGetID(PrintExpr(op->value), from_ty);
+     for (int i = 0, lanes = from_ty.lanes(); i < lanes; ++i) {
+-      std::ostringstream val;
+-      val << "(";
+-      PrintType(target_ty.element_of(), val);
+-      val << ")" << type_cvt << "(";
+-      PrintVecElemLoad(src, from_ty, i, val);
+-      val << ")";
+-      PrintVecElemStore(sret, target_ty, i, val.str());
++      std::ostringstream value;
++      PrintVecElemLoad(src, from_ty, i, value);
++      PrintVecElemStore(sret, target_ty, i,
++                        stochastic ? stochastic_value(value.str(), i)
++                                   : CastFromTo(value.str(), from_ty.element_of(),
++                                                target_ty.element_of()));
+     }
+   }
+   os << sret;
+@@ -3019,7 +3117,19 @@
+     os << "__builtin_bit_cast(";
+     this->PrintType(op->dtype, os);
+     os << ", ";
++    DataType source_type = op->args[0].dtype();
++    bool narrow_integer = source_type.is_scalar() && source_type.bits() < 32 &&
++                          (source_type.is_int() || source_type.is_uint());
++    if (narrow_integer) {
++      // C++ promotes narrow integer arithmetic to int. Restore the TIR width
++      // before bit_cast, whose operand sizes must match exactly.
++      os << "static_cast<";
++      this->PrintType(source_type, os);
++      os << ">(";
++    }
+     this->PrintExpr(op->args[0], os);
++    if (narrow_integer)
++      os << ")";
+     os << ")";
+     return;
+   }
+@@ -3950,8 +4060,20 @@
+ 
+ void CodeGenTileLangHCU::VisitExpr_(const RampNode *op, std::ostream &os) {
+   int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
+-  ICHECK_LE(lanes, 4)
+-      << "ValueError: Ramp of more than 4 lanes is not allowed.";
++  if (lanes > 4) {
++    std::string base = PrintExpr(op->base);
++    std::string stride = PrintExpr(op->stride);
++    std::string result = name_supply_->FreshName("_ramp");
++    PrintIndent();
++    PrintType(op->dtype, stream);
++    stream << ' ' << result << ";\n";
++    for (int i = 0; i < lanes; ++i)
++      PrintVecElemStore(result, op->dtype, i,
++                        "(" + base + ") + (" + stride + ") * " +
++                            std::to_string(i));
++    os << result;
++    return;
++  }
+   os << "(make_";
+   PrintType(op->dtype, os);
+   os << "(";
+@@ -3988,6 +4110,20 @@
+ void CodeGenTileLangHCU::VisitExpr_(const BroadcastNode *op,
+                                     std::ostream &os) { // NOLINT(*)
+   int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
++  if (op->dtype.is_float4_e2m1fn() || op->dtype.is_float8() ||
++      (op->dtype.is_vector_bool() && lanes > 4) ||
++      ((op->dtype.is_int() || op->dtype.is_uint()) &&
++       (op->dtype.bits() == 32 || op->dtype.bits() == 64) && lanes == 8)) {
++    std::string value = PrintExpr(op->value);
++    std::string result = name_supply_->FreshName("_fp4_broadcast");
++    PrintIndent();
++    PrintType(op->dtype, stream);
++    stream << ' ' << result << ";\n";
++    for (int i = 0; i < lanes; ++i)
++      PrintVecElemStore(result, op->dtype, i, value);
++    os << result;
++    return;
++  }
+   if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8 &&
+       lanes == 4) {
+     // make_int8x4
+@@ -4116,6 +4252,13 @@
+ 
+ inline void PrintConst(const FloatImmNode *op, std::ostream &os,
+                        CodeGenTileLangHCU *p) { // NOLINT(*)
++  if (op->dtype.is_float4_e2m1fn()) {
++    os << "tl::pk_fp4_t(";
++    FloatImm const_f32 = FloatImm(DataType::Float(32), op->value);
++    PrintConst(const_f32.get(), os, p);
++    os << ')';
++    return;
++  }
+   // Type code is kBFloat
+   if (op->dtype.is_bfloat16()) {
+     os << "bfloat16_t(";
+@@ -4129,8 +4272,10 @@
+     return;
+   } else if (op->dtype.is_float8_e4m3fnuz() || op->dtype.is_float8_e4m3() ||
+              op->dtype.is_float8_e4m3fn()) {
+-    os << "fp8_e4_t";
+-    os << '(' << std::scientific << op->value << 'f' << ')';
++    os << "(fp8_e4_t)fp8_cvt_t(";
++    FloatImm const_f32 = FloatImm(DataType::Float(32), op->value);
++    PrintConst(const_f32.get(), os, p);
++    os << ')';
+     return;
+   }
+   // Type code is kFloat
+@@ -4146,7 +4291,10 @@
+     } else if (std::isnan(op->value)) {
+       temp << ((op->dtype.bits() == 32) ? "NAN" : "NAN");
+     } else {
+-      temp << std::scientific << op->value;
++      // Preserve the source value when the generated literal is parsed again.
++      // Six decimal places can perturb reciprocals enough to change ceil(log2).
++      temp << std::scientific
++           << std::setprecision(op->dtype.bits() == 32 ? 9 : 17) << op->value;
+       if (op->dtype.bits() == 32)
+         temp << 'f';
+     }
+--- a/src/hcu/codegen/codegen_hcu.h
++++ b/src/hcu/codegen/codegen_hcu.h
+@@ -201,6 +201,7 @@
+   bool need_wmma_h_{false};
+   // whether need fp8.h
+   bool enable_fp8_{false};
++  bool enable_stochastic_round_{false};
+   // whether need gemm_mls.h (when gemm uses MLS or matrix_load exists)
+   bool enable_gemm_mls_{false};
+   // whether need tilelang_ds_read_format.hpp for layout-aware ds_read_m32x16
+--- a/src/tl_templates/hcu/core.hpp
++++ b/src/tl_templates/hcu/core.hpp
+@@ -29,6 +29,7 @@
+ #include <tl_templates/hcu/core/numeric/bfloat16.hpp>
+ #include <tl_templates/hcu/core/numeric/float8.hpp>
+ #include <tl_templates/hcu/core/numeric/half.hpp>
++#include <tl_templates/hcu/core/numeric/pk_fp4.hpp>
+ #include <tl_templates/hcu/core/numeric/int8.hpp>
+ #include <tl_templates/hcu/core/numeric/integer.hpp>
+ #include <tl_templates/hcu/core/numeric/integral_constant.hpp>
+--- /dev/null
++++ b/src/tl_templates/hcu/stochastic_round.h
+@@ -0,0 +1,44 @@
++// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
++// SPDX-License-Identifier: MIT
++#pragma once
++
++#include <cmath>
++#include <tl_templates/hcu/common.h>
++
++namespace tl {
++
++// Select a neighboring representable level using the caller's random bits.
++// Return FP32 so the ordinary numeric conversion can pack the selected level.
++template <int Mantissa>
++TL_DEVICE float stochastic_round_to_float32(float value, uint32_t random_bits,
++                                            int lane) {
++  uint32_t bits = bit_cast<uint32_t>(value);
++  uint32_t magnitude_bits = bits & 0x7fffffffU;
++  if constexpr (Mantissa == 7) {
++    if (magnitude_bits > 0x7f800000U)
++      return bit_cast<float>(bits | 0x00400000U);
++    if (magnitude_bits == 0x7f800000U)
++      return value;
++    uint32_t noise = (random_bits >> ((lane % 2) * 16)) & 0xffffU;
++    return bit_cast<float>((bits + noise) & 0xffff0000U);
++  } else {
++    static_assert(Mantissa == 3 || Mantissa == 1,
++                  "Expected E4M3 or E2M1 mantissa width");
++    constexpr float maximum = Mantissa == 3 ? 448.0f : 6.0f;
++    constexpr uint32_t minimum_exponent = Mantissa == 3 ? 121U : 127U;
++    if (magnitude_bits > 0x7f800000U) {
++      if constexpr (Mantissa == 3)
++        return value;
++      return bit_cast<float>(bit_cast<uint32_t>(maximum) | (bits & 0x80000000U));
++    }
++    float magnitude = fminf(fabsf(value), maximum);
++    uint32_t exponent = (bit_cast<uint32_t>(magnitude) >> 23) & 255U;
++    exponent = exponent < minimum_exponent ? minimum_exponent : exponent;
++    float spacing = bit_cast<float>((exponent - Mantissa) << 23);
++    float noise = float((random_bits >> ((lane % 4) * 8)) & 255U) * (1.0f / 256.0f);
++    float rounded = floorf(magnitude / spacing + noise) * spacing;
++    return bit_cast<float>(bit_cast<uint32_t>(rounded) | (bits & 0x80000000U));
++  }
++}
++
++} // namespace tl
+--- /dev/null
++++ b/testing/python/hcu/test_tilelang_hcu_fp4_cast.py
+@@ -0,0 +1,229 @@
++import pytest
++import torch
++
++import tilelang
++import tilelang.language as T
++
++
++@pytest.mark.parametrize("vec", [4, 32])
++def test_hcu_fp4_fragment_cast_and_packed_store(vec):
++    n = 64 * vec
++    @T.prim_func
++    def kernel(A: T.Tensor((n,), T.float32),
++               B: T.Tensor((n,), T.float4_e2m1fn),
++               C: T.Tensor((n,), T.float32)):
++        with T.Kernel(1, threads=64):
++            values = T.alloc_fragment((n,), T.float32)
++            packed = T.alloc_fragment((n,), T.float4_e2m1fn)
++            restored = T.alloc_fragment((n,), T.float32)
++            T.annotate_layout({
++                values: T.Fragment((n,), lambda i: (i // vec, i % vec)),
++                packed: T.Fragment((n,), lambda i: (i // vec, i % vec)),
++                restored: T.Fragment((n,), lambda i: (i // vec, i % vec)),
++            })
++            T.copy(A, values)
++            for i in T.Parallel(n):
++                packed[i] = T.cast(values[i], T.float4_e2m1fn)
++            T.copy(packed, B)
++            for i in T.Parallel(n):
++                restored[i] = T.cast(packed[i], T.float32)
++            T.copy(restored, C)
++
++    compiled = tilelang.compile(kernel)
++    levels = [0., .5, 1., 1.5, 2., 3., 4., 6.,
++              -0., -.5, -1., -1.5, -2., -3., -4., -6.]
++    x = torch.tensor(levels * (n // 16), dtype=torch.float32, device='cuda')
++    packed = torch.empty(n // 2, dtype=torch.uint8, device='cuda')
++    restored = torch.empty_like(x)
++    compiled(x, packed, restored)
++    expected = torch.tensor([i | ((i + 1) << 4) for i in range(0, 16, 2)] * (n // 16),
++                            dtype=torch.uint8, device='cuda')
++    torch.testing.assert_close(packed, expected, rtol=0, atol=0)
++    torch.testing.assert_close(restored, x, rtol=0, atol=0)
++    assert torch.equal(torch.signbit(restored), torch.signbit(x))
++
++
++def test_hcu_fp4_predicated_copy_zero_padding():
++    n = 256
++    @T.prim_func
++    def kernel(A: T.Tensor((128,), T.float4_e2m1fn),
++               B: T.Tensor((n,), T.float32)):
++        with T.Kernel(1, threads=64):
++            shared = T.alloc_shared((n,), T.float4_e2m1fn)
++            T.copy(A[0], shared)
++            for i in T.Parallel(n):
++                B[i] = T.cast(shared[i], T.float32)
++
++    compiled = tilelang.compile(kernel)
++    # 0x22 packs two E2M1 values of +1.0.
++    packed = torch.full((64,), 0x22, dtype=torch.uint8, device='cuda')
++    restored = torch.empty(256, dtype=torch.float32, device='cuda')
++    compiled(packed, restored)
++    expected = torch.cat([torch.ones(128, device='cuda'), torch.zeros(128, device='cuda')])
++    torch.testing.assert_close(restored, expected, rtol=0, atol=0)
++
++
++def test_hcu_bf16_reinterpret_narrow_integer_arithmetic():
++    @T.prim_func
++    def kernel(A: T.Tensor((64,), T.int32), B: T.Tensor((64,), T.float32)):
++        with T.Kernel(1, threads=64):
++            i = T.get_thread_binding()
++            B[i] = T.cast(T.reinterpret(T.cast(A[i] + 127, T.uint16) << 7,
++                                       T.bfloat16), T.float32)
++
++    compiled = tilelang.compile(kernel)
++    exponents = torch.arange(64, dtype=torch.int32, device='cuda') % 21 - 10
++    actual = torch.empty(64, dtype=torch.float32, device='cuda')
++    compiled(exponents, actual)
++    torch.testing.assert_close(actual, torch.exp2(exponents.float()), rtol=0, atol=0)
++
++
++@pytest.mark.parametrize('vec', [8, 16])
++@pytest.mark.parametrize('value_dtype', ['bfloat16', 'float16'])
++def test_hcu_fp8_low_precision_vector_cast(vec, value_dtype):
++    n = 64 * vec
++
++    @T.prim_func
++    def kernel(A: T.Tensor((n,), value_dtype),
++               B: T.Tensor((n,), T.float8_e4m3fn),
++               C: T.Tensor((n,), value_dtype)):
++        with T.Kernel(1, threads=64):
++            values = T.alloc_fragment((n,), value_dtype)
++            quantized = T.alloc_fragment((n,), T.float8_e4m3fn)
++            restored = T.alloc_fragment((n,), value_dtype)
++            T.annotate_layout({
++                values: T.Fragment((n,), lambda i: (i // vec, i % vec)),
++                quantized: T.Fragment((n,), lambda i: (i // vec, i % vec)),
++                restored: T.Fragment((n,), lambda i: (i // vec, i % vec)),
++            })
++            T.copy(A, values)
++            for i in T.Parallel(n):
++                quantized[i] = T.cast(values[i], T.float8_e4m3fn)
++            T.copy(quantized, B)
++            for i in T.Parallel(n):
++                restored[i] = T.cast(quantized[i], value_dtype)
++            T.copy(restored, C)
++
++    compiled = tilelang.compile(kernel)
++    levels = torch.arange(127, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
++    x = torch.cat([levels, -levels]).repeat((n + 253) // 254)[:n].to('cuda', getattr(torch, value_dtype))
++    quantized = torch.empty(n, dtype=torch.float8_e4m3fn, device='cuda')
++    restored = torch.empty_like(x)
++    compiled(x, quantized, restored)
++    torch.testing.assert_close(quantized.view(torch.uint8), x.to(torch.float8_e4m3fn).view(torch.uint8), rtol=0, atol=0)
++    torch.testing.assert_close(restored, x, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("index_dtype", ["int32", "int64"])
++def test_hcu_eight_lane_integer_ramp_arithmetic(index_dtype):
++    offset = 2**33 if index_dtype == "int64" else 0
++    @T.prim_func
++    def kernel(B: T.Tensor((512,), index_dtype)):
++        with T.Kernel(1, threads=64):
++            tid = T.get_thread_binding()
++            indices = T.Ramp(tid * 8, 1, 8)
++            values = T.Ramp(T.cast(tid, index_dtype) * 8 + T.cast(offset, index_dtype), T.cast(1, index_dtype), 8)
++            B[indices] = T.Select(values % T.Broadcast(T.cast(7, index_dtype), 8) < T.Broadcast(T.cast(3, index_dtype), 8), values, -values)
++
++    compiled = tilelang.compile(kernel)
++    dtype = getattr(torch, index_dtype)
++    actual = torch.empty(512, dtype=dtype, device='cuda')
++    compiled(actual)
++    indices = torch.arange(512, dtype=dtype, device='cuda') + offset
++    torch.testing.assert_close(actual, torch.where(indices % 7 < 3, indices, -indices), rtol=0, atol=0)
++
++
++def test_hcu_float_literals_preserve_bits():
++    @T.prim_func
++    def kernel(A: T.Tensor((64, 4), T.float32), B: T.Tensor((64, 2), T.float64)):
++        with T.Kernel(1, threads=64):
++            i = T.get_thread_binding()
++            A[i, 0] = T.float32(1 / 6)
++            A[i, 1] = T.float32(1 / 4096)
++            A[i, 2] = T.float32(1 / 448)
++            A[i, 3] = T.float32(0.1)
++            B[i, 0] = T.float64(1 / 6)
++            B[i, 1] = T.float64(1 / 7)
++
++    compiled = tilelang.compile(kernel)
++    actual32 = torch.empty((64, 4), dtype=torch.float32, device='cuda')
++    actual64 = torch.empty((64, 2), dtype=torch.float64, device='cuda')
++    compiled(actual32, actual64)
++    expected32 = torch.tensor([1 / 6, 1 / 4096, 1 / 448, 0.1], dtype=torch.float32, device='cuda').expand_as(actual32)
++    expected64 = torch.tensor([1 / 6, 1 / 7], dtype=torch.float64, device='cuda').expand_as(actual64)
++    torch.testing.assert_close(actual32.view(torch.int32), expected32.contiguous().view(torch.int32), rtol=0, atol=0)
++    torch.testing.assert_close(actual64.view(torch.int64), expected64.contiguous().view(torch.int64), rtol=0, atol=0)
++
++
++@pytest.mark.parametrize('value_dtype', ['float16', 'float32'])
++def test_hcu_scalar_fp4_loads_both_nibbles(value_dtype):
++    @T.prim_func
++    def kernel(A: T.Tensor((128,), T.float4_e2m1fn),
++               B: T.Tensor((128,), value_dtype)):
++        with T.Kernel(1, threads=64):
++            i = T.get_thread_binding()
++            B[2 * i] = T.cast(A[2 * i], value_dtype)
++            B[2 * i + 1] = T.cast(A[2 * i + 1], value_dtype)
++
++    compiled = tilelang.compile(kernel)
++    packed = torch.tensor([i | ((i + 1) << 4) for i in range(0, 16, 2)] * 8,
++                          dtype=torch.uint8, device='cuda')
++    actual = torch.empty(128, dtype=getattr(torch, value_dtype), device='cuda')
++    compiled(packed, actual)
++    levels = [0., .5, 1., 1.5, 2., 3., 4., 6.,
++              -0., -.5, -1., -1.5, -2., -3., -4., -6.]
++    expected = torch.tensor(levels * 8, dtype=actual.dtype, device='cuda')
++    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++    assert torch.equal(torch.signbit(actual), torch.signbit(expected))
++
++
++@pytest.mark.parametrize('fmt', ['bfloat16', 'float8_e4m3fn', 'float4_e2m1fn'])
++def test_hcu_stochastic_cast_known_random_bits(fmt):
++    target_dtype = T.dtype(fmt)
++    vector_dtype = T.dtype(fmt + 'x4')
++
++    @T.prim_func
++    def kernel(A: T.Tensor((256,), T.float32), B: T.Tensor((256,), target_dtype)):
++        with T.Kernel(1, threads=64):
++            indices = T.Ramp(T.get_thread_binding() * 4, 1, 4)
++            B[indices] = T.cast(A[indices], vector_dtype, round='rs', rbits=T.uint32(0xC0804000))
++
++    compiled = tilelang.compile(kernel)
++    if fmt == 'bfloat16':
++        midpoint, upper = 1 + 2**-8, 1 + 2**-7
++        pattern = [1., upper, 1., upper]
++    elif fmt == 'float8_e4m3fn':
++        midpoint, upper = 1 + 2**-4, 1 + 2**-3
++        pattern = [1., 1., upper, upper]
++    else:
++        midpoint, upper = 1.25, 1.5
++        pattern = [1., 1., upper, upper]
++    signs = torch.where(torch.arange(64, device='cuda') % 2 == 0, 1., -1.)
++    x = (torch.full((64, 4), midpoint, device='cuda') * signs[:, None]).reshape(-1)
++    if fmt == 'float4_e2m1fn':
++        actual = torch.empty(128, dtype=torch.uint8, device='cuda')
++        compiled(x, actual)
++        expected = torch.tensor([[0x22, 0x33] if i % 2 == 0 else [0xAA, 0xBB] for i in range(64)],
++                                dtype=torch.uint8, device='cuda').reshape(-1)
++        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++    else:
++        actual = torch.empty(256, dtype=getattr(torch, fmt), device='cuda')
++        compiled(x, actual)
++        expected = (torch.tensor(pattern, device='cuda')[None, :] * signs[:, None]).reshape(-1)
++        torch.testing.assert_close(actual.float(), expected, rtol=0, atol=0)
++
++
++def test_hcu_stochastic_bf16_preserves_subnormals():
++    @T.prim_func
++    def kernel(A: T.Tensor((128,), T.float32), B: T.Tensor((128,), T.bfloat16)):
++        with T.Kernel(1, threads=64):
++            indices = T.Ramp(T.get_thread_binding() * 2, 1, 2)
++            B[indices] = T.cast(A[indices], T.dtype('bfloat16x2'), round='rs', rbits=T.uint32(0xC0004000))
++
++    compiled = tilelang.compile(kernel)
++    # Halfway between BF16 subnormal codes 1 and 2, without FP32 arithmetic.
++    x = torch.full((128,), 0x00018000, dtype=torch.int32, device='cuda').view(torch.float32)
++    actual = torch.empty(128, dtype=torch.bfloat16, device='cuda')
++    compiled(x, actual)
++    expected_bits = torch.tensor([1, 2] * 64, dtype=torch.int16, device='cuda')
++    torch.testing.assert_close(actual.view(torch.int16), expected_bits, rtol=0, atol=0)

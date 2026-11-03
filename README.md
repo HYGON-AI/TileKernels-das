@@ -1,25 +1,36 @@
 # Tile Kernels
 
-Optimized GPU kernels for LLM operations, built with [tilelang-hygon](https://github.com/tile-ai/tilelang-hygon). TileLang is a domain-specific language for expressing high-performance GPU kernels in Python, featuring easy migration, agile development, and automatic optimization.
+> Integration status: this branch adopts the upstream v2.0.0 APIs and upstream kernel implementations, with existing HYGON compiler fixes retained. Remaining HYGON kernel adaptations are pending review and GPU validation. The requirements below are upstream requirements; compatibility with the DTK software stack has not been established.
 
-Most kernels in this project approach the limit of hardware performance regarding the compute intensity and memory bandwidth. Some of them have already been used in internal training and inference scenarios. However, they do not represent best practices and we are actively working on improving the code quality and documentation.
+TileKernels is a library of dozens of highly optimized kernels implemented in [TileLang](https://github.com/tile-ai/tilelang), a domain-specific language supporting multiple hardware backends. It provides kernels for several common operations in LLM training and inference, including mixture-of-experts routing, Engram, quantization, and manifold hyper-connections. Most kernels achieve performance close to the hardware's compute or memory bandwidth limits. All of these kernels have already been used in our internal training and inference workloads.
+
+> TileKernels 是一个包含数十个深度优化算子的高性能算子库，基于支持多种硬件后端的领域专用语言 [TileLang](https://github.com/tile-ai/tilelang) 实现。它为大语言模型训练与推理中的几项常见操作提供算子，包括混合专家路由、Engram、量化和流形超连接（mHC）。大多数算子的性能接近硬件的计算吞吐或内存带宽上限。全部算子已用于我们的内部训练与推理任务。
+
+## News
+
+- **[2026-09-30] Huawei Ascend support**: Added Huawei Ascend support and updated the usage documentation. Following the NVIDIA path, the kernels now ship a second backend that is selected automatically at runtime, so the same Python APIs run on both NVIDIA GPUs and Huawei NPUs.
 
 ## Features
 
-- **Gating** — Top-k expert selection and scoring for Mixture of Experts routing
-- **MoE Routing** — Token-to-expert mapping, fused expansion/reduction and weight normalization
-- **Quantization** — Per-token, per-block, and per-channel FP8/FP4/E5M6 casting with fused SwiGLU+quantization ops
-- **Transpose** — Batched transpose operations
+- **MoE Routing** — Top-k expert selection and scoring for Mixture of Experts routing
+- **Quantization** — Per-token, per-block, and per-channel FP8/FP4 casting and dequantization, with fused SwiGLU+quantization ops
 - **Engram** — Engram gating kernels with fused RMSNorm, forward/backward passes and weight gradient reduction
 - **Manifold HyperConnection** — Hyper-connection kernels including Sinkhorn normalization and mix splitting/application
-- **Modeling** — High-level `torch.autograd.Function` wrappers composing low-level kernels into trainable layers (engram gate, mHC pipeline)
+- **Transform** — RoPE kernel
+- **Rand** - Rand kernel
+- **Modeling** — High-level `torch.autograd.Function` wrapper for the Engram gate
 
 ## Requirements
 
-- Python 3.10 or higher
-- PyTorch 2.10 or higher
-- TileLang 1.12.0 or higher
-- HYGON BW1000, BW1100, BW150, or K100_AI (DTK software stack required)
+- Python 3.12 or higher
+- PyTorch 2.13 or higher
+- TileLang 0.1.15 or higher
+- CUDA Backend
+  - NVIDIA SM90 or SM100 architecture GPU
+  - CUDA Toolkit 13.1 or higher
+- Ascend Backend
+  - Ascend 950 NPU
+  - CANN 9.2.0 or higher
 
 ## Installation
 
@@ -27,6 +38,22 @@ Most kernels in this project approach the limit of hardware performance regardin
 
 ```bash
 pip install -e ".[dev]"
+```
+
+### HCU development compiler patch
+
+The HCU quantization tests require the [low-precision codegen patch](patches/tilelang-hcu-low-precision-codegen.patch)
+for `tilelang-hygon` at `9f3bbcd37e0955dfd1360501c95c48095d9f9bf8`.
+It fixes FP4/FP8 packing, numeric conversions, padding, narrow-integer bit reinterpretation,
+wide vector index generation, exact floating-point literal emission, and BF16/FP8/FP4 stochastic rounding. It includes seventeen compiler regression cases and excludes unrelated distributed changes.
+The [HCU integration review](patches/hcu-integration-review.json) records the kernel changes and validation scope.
+For an unpatched TileLang checkout:
+
+```bash
+cd /path/to/tilelang-hygon
+git apply /path/to/TileKernels-das/patches/tilelang-hcu-low-precision-codegen.patch
+cmake --build build -j 8
+CUDA_VISIBLE_DEVICES=0 TILELANG_DISABLE_CACHE=1 python -m pytest -q testing/python/hcu/test_tilelang_hcu_fp4_cast.py
 ```
 
 ### Install a release version
@@ -42,42 +69,55 @@ Tests using pytest:
 ### Test single test file
 
 ```bash
-pytest tests/transpose/test_transpose.py -n 4 # Correctness only with 4 workers
-pytest tests/transpose/test_transpose.py --run-benchmark # Correctness + Benchmarking
+python -m pytest tests/quant/test_per_token_cast.py -n 4 # Correctness only with 4 workers
+python -m pytest tests/quant/test_per_token_cast.py --run-benchmark # Correctness + Benchmarking
 ```
 
-### Pressure test
+### Test level
+
+`TK_TEST_LEVEL` defaults to `0` (core tests). Level `1` adds extended coverage;
+level `2` also includes multi-billion-element cast tests with high GPU memory usage.
 
 ```bash
-TK_FULL_TEST=1 pytest -n 4 --count 2
+TK_TEST_LEVEL=0 python -m pytest -n 4 # Core tests
+TK_TEST_LEVEL=2 python -m pytest -n 4 --count 2 # Full tests
+```
+
+## Development
+
+Install pre commit hooks.
+
+```bash
+pre-commit install --install-hooks
 ```
 
 ## Project Structure
 
 ```txt
 tile_kernels/
-├── moe/        # Mixture of Experts routing related kernels
-├── quant/      # FP8/FP4/E5M6 quantization
-├── transpose/  # Batched transpose
 ├── engram/     # Engram gating kernels
 ├── mhc/        # Manifold HyperConnection kernels
-├── modeling/   # High-level autograd modeling layers (engram, mHC)
+├── modeling/   # High-level autograd modeling layer (engram)
+├── moe/        # Mixture of Experts routing kernels
+├── quant/      # Quantization kernels
+├── rand/       # Random number generator kernel
+├── testing/    # Test and benchmark utilities
 ├── torch/      # PyTorch reference implementations
-└── testing/    # Test and benchmark utilities
+└── transform/  # Rotary position embedding kernel
 ```
 
 ## Acknowledgement
 
-This project is built on [TileLang](https://github.com/tile-ai/tilelang). Thanks and respect to the developers!
+This project is built on [TileLang](https://github.com/tile-ai/tilelang), and we extend our thanks and respect to its developers. We also gratefully acknowledge Huawei for its technical support and engineering expertise throughout the development of Tile Kernels' Ascend backend.
 
 ## License
 
-This repository is based on the following fixed upstream baseline:
+This repository is based on the following upstream integration baseline:
 
 - Upstream project: TileKernels
 - Upstream repository: https://github.com/deepseek-ai/TileKernels
 - Upstream branch: `main`
-- Upstream Commit: [`36d9e45d38e204ebb87e6f6e833821eee0482fe5`](https://github.com/deepseek-ai/TileKernels/commit/36d9e45d38e204ebb87e6f6e833821eee0482fe5)
+- Upstream Commit: [`828cc15d17e2ef4b351c2cb6021de02fde82330e`](https://github.com/deepseek-ai/TileKernels/commit/828cc15d17e2ef4b351c2cb6021de02fde82330e)
 - Upstream license: [MIT License](https://github.com/deepseek-ai/TileKernels/blob/main/LICENSE)
 
 Hygon adaptations, modifications, and original contributions are licensed under the MIT License.
@@ -91,7 +131,7 @@ Original copyright notices and license terms from the upstream TileKernels proje
 ```bibtex
 @misc{tilekernels,
       title={TileKernels},
-      author={Xiangwen Wang, Chenhao Xu, Huanqi Cao, Rui Tian, Weilin Zhao, Kuai Yu and Chenggang Zhao},
+      author={Xiangwen Wang, Chenhao Xu, Huanqi Cao, Luotian Huang, Yuxuan Zhou, Weilin Zhao, Rui Tian, Anyi Xu, Fucong Dai, Kuai Yu, Ruifan Xu, Yi Qian, Shengyuan Jia, Chenggang Zhao, Wei Zhang and Lei Wang},
       year={2026},
       publisher = {GitHub},
       howpublished = {\url{https://github.com/deepseek-ai/TileKernels}},

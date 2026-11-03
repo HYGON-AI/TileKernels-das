@@ -7,7 +7,7 @@ from typing import Callable
 import pytest
 import torch
 
-from tile_kernels.modeling.mhc.ops import hc_split_sinkhorn
+from tile_kernels.mhc import mhc_pre_split_mixes_fwd, mhc_sinkhorn_fwd
 
 
 def hc_split_sinkhorn_ref(
@@ -42,16 +42,35 @@ def hc_split_sinkhorn_ref(
     return pre, post, comb
 
 
-def _tester(
-    impl: Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+def make_hc_split_sinkhorn_runner(
     mixes: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
     hc_mult: int,
     sinkhorn_iters: int,
     eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return impl(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
+) -> Callable[[], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Compose the upstream split and Sinkhorn APIs; allocate outside timing.
+
+    The old fused hc_split_sinkhorn entry point no longer exists upstream.
+    This runner preserves its results but launches two kernels.
+    """
+    b, s, width = mixes.shape
+    assert width == (2 + hc_mult) * hc_mult
+    mixes_flat = mixes.contiguous().view(b * s, width)
+    pre = torch.empty((b * s, hc_mult), dtype=mixes.dtype, device=mixes.device)
+    post = torch.empty_like(pre)
+    comb_logits = torch.empty((b * s, hc_mult * hc_mult), dtype=mixes.dtype, device=mixes.device)
+    comb_logits_matrix = comb_logits.view(b * s, hc_mult, hc_mult)
+    comb = torch.empty_like(comb_logits_matrix)
+    outputs = (pre.view(b, s, hc_mult), post.view(b, s, hc_mult), comb.view(b, s, hc_mult, hc_mult))
+
+    def run() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mhc_pre_split_mixes_fwd(mixes_flat, hc_scale, hc_base, pre, post, comb_logits, 2.0, eps)
+        mhc_sinkhorn_fwd(comb_logits_matrix, comb, sinkhorn_iters, eps)
+        return outputs
+
+    return run
 
 
 def _estimate_io_bytes(b: int, s: int, hc_mult: int) -> int:
@@ -59,14 +78,17 @@ def _estimate_io_bytes(b: int, s: int, hc_mult: int) -> int:
     mix_hc = (2 + hc_mult) * hc_mult
     read_bytes = n * mix_hc * 4 + 3 * 4 + mix_hc * 4
     write_bytes = n * hc_mult * 4 + n * hc_mult * 4 + n * hc_mult * hc_mult * 4
-    return read_bytes + write_bytes
+    # The two-kernel composition additionally writes and reads intermediate logits.
+    return read_bytes + write_bytes + 2 * n * hc_mult * hc_mult * 4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA is required')
 @pytest.mark.parametrize('b', [1, 2])
 @pytest.mark.parametrize('s', [1, 257])
 @pytest.mark.parametrize('hc_mult', [4])
-def test_hc_split_sinkhorn_comprehensive(b: int, s: int, hc_mult: int) -> None:
+@pytest.mark.parametrize('sinkhorn_iters', [1, 10])
+@pytest.mark.parametrize('eps', [1e-6, 1e-2])
+def test_hc_split_sinkhorn_comprehensive(b: int, s: int, hc_mult: int, sinkhorn_iters: int, eps: float) -> None:
     torch.manual_seed(2026)
     torch.cuda.manual_seed_all(2026)
 
@@ -75,15 +97,9 @@ def test_hc_split_sinkhorn_comprehensive(b: int, s: int, hc_mult: int) -> None:
     hc_scale = torch.randn((3,), dtype=torch.float32, device='cuda')
     hc_base = torch.randn((mix_hc,), dtype=torch.float32, device='cuda')
 
-    sinkhorn_iters = 10
-    eps = 1e-6
-
-    pre_tl, post_tl, comb_tl = _tester(
-        hc_split_sinkhorn, mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
-    )
-    pre_ref, post_ref, comb_ref = _tester(
-        hc_split_sinkhorn_ref, mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
-    )
+    run = make_hc_split_sinkhorn_runner(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
+    pre_tl, post_tl, comb_tl = run()
+    pre_ref, post_ref, comb_ref = hc_split_sinkhorn_ref(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
 
     torch.testing.assert_close(pre_tl, pre_ref)
     torch.testing.assert_close(post_tl, post_ref)
@@ -117,14 +133,13 @@ def test_hc_split_sinkhorn_benchmark(
     hc_base = torch.randn((mix_hc,), dtype=torch.float32, device='cuda')
     eps = 1e-6
 
-    def fn_tl() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
+    fn_tl = make_hc_split_sinkhorn_runner(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
 
     def fn_ref() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return hc_split_sinkhorn_ref(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
 
-    fn_tl()
-    fn_ref()
+    for actual, expected in zip(fn_tl(), fn_ref()):
+        torch.testing.assert_close(actual, expected)
 
     t_tl_us = benchmark_timer(fn_tl)
     t_ref_us = benchmark_timer(fn_ref)
@@ -135,12 +150,13 @@ def test_hc_split_sinkhorn_benchmark(
     bw_ref_gbs = io_bytes / t_ref_us / 1e3
 
     benchmark_record(
-        kernel='mhc_split_sinkhorn',
+        kernel='mhc_pre_split_mixes_then_sinkhorn',
         operation='fwd',
         params={'b': b, 's': s, 'hc_mult': hc_mult, 'sinkhorn_iters': sinkhorn_iters},
         time_us=t_tl_us,
         bandwidth_gbs=bw_tl_gbs,
         extras={
+            'implementation': 'two upstream kernels; buffers preallocated',
             'ref_time_us': t_ref_us,
             'bw_ref_gbs': bw_ref_gbs,
             'speedup': speedup,

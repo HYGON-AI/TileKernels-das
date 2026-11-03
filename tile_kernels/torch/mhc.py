@@ -85,90 +85,27 @@ def mhc_pre_norm_fn_ref(
     return mixes.view(*residual.shape[:2], -1)
 
 
-def _quantize_tf32(x: torch.Tensor) -> torch.Tensor:
-    """Round FP32 values to the TF32 input format in software."""
-    bits = x.contiguous().view(torch.int32)
-    return ((bits + 0x1000).bitwise_and(-0x2000)).view(torch.float32)
-
-
-class _MHCPreNormFnRefTLAlign(torch.autograd.Function):
-    """Reference with software TF32 inputs matching TileLang MHCPreNormFn."""
-
-    @staticmethod
-    def forward(
-        ctx: '_MHCPreNormFnRefTLAlign',
-        residual: torch.Tensor,
-        mhc_fn: torch.Tensor,
-        mhc_norm_eps: float,
-    ) -> torch.Tensor:
-        mhc_fn = _quantize_tf32(mhc_fn)
-
-        mhc_mult3, rms_group_size = mhc_fn.shape
-        x = residual.flatten(2, 3).float().reshape(-1, rms_group_size)
-        num_tokens = x.shape[0]
-        n_rms_group = 1
-
-        x_grouped = x.view(num_tokens, n_rms_group, rms_group_size)
-        fn_grouped = mhc_fn.view(mhc_mult3, n_rms_group, rms_group_size)
-
-        allow_tf32 = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = False
-        try:
-            out_mul = torch.einsum('mbk,nbk->mbn', x_grouped, fn_grouped)
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
-        sqrsum = x_grouped.square().sum(-1)
-
-        rms = (sqrsum / rms_group_size + mhc_norm_eps).rsqrt()
-        out = (out_mul * rms.unsqueeze(-1)).sum(-2)
-
-        ctx.save_for_backward(x, mhc_fn, out_mul, sqrsum)
-        ctx.mhc_norm_eps = mhc_norm_eps
-        ctx.rms_group_size = rms_group_size
-        ctx.residual_shape = residual.shape
-        ctx.residual_dtype = residual.dtype
-        return out.view(*residual.shape[:-2], mhc_mult3)
-
-    @staticmethod
-    def backward(
-        ctx: '_MHCPreNormFnRefTLAlign',
-        out_grad: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, None]:
-        x, mhc_fn, out_mul, sqrsum = ctx.saved_tensors
-        mhc_norm_eps = ctx.mhc_norm_eps
-        rms_group_size = ctx.rms_group_size
-
-        mhc_mult3 = mhc_fn.shape[0]
-        num_tokens = x.shape[0]
-
-        out_grad = out_grad.reshape(num_tokens, mhc_mult3)
-        rms = (sqrsum / rms_group_size + mhc_norm_eps).rsqrt()
-
-        out_mul_grad = out_grad * rms
-        rms_grad = (out_grad * out_mul.squeeze(1)).sum(-1, keepdim=True)
-        sqrsum_grad = rms_grad * rms / (sqrsum + mhc_norm_eps * rms_group_size) / -2
-
-        out_mul_grad = _quantize_tf32(out_mul_grad.unsqueeze(1))
-
-        allow_tf32 = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = False
-        try:
-            fn_grad = out_mul_grad.squeeze(1).T @ x
-            x_grad = out_mul_grad.squeeze(1) @ mhc_fn
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
-
-        x_grad = x_grad + 2 * x * sqrsum_grad
-        residual_grad = x_grad.reshape(ctx.residual_shape).to(ctx.residual_dtype)
-        return residual_grad, fn_grad, None
-
-
-def mhc_pre_norm_fn_ref_tl_align(
+def mhc_pre_norm_fn_partials_ref(
     residual: torch.Tensor,
-    mhc_fn: torch.Tensor,
-    mhc_norm_weight: torch.Tensor | None,
-    mhc_norm_eps: float,
-) -> torch.Tensor:
-    if mhc_norm_weight is not None:
-        mhc_fn = mhc_fn * mhc_norm_weight
-    return _MHCPreNormFnRefTLAlign.apply(residual, mhc_fn, mhc_norm_eps)
+    fn: torch.Tensor,
+    n_splits: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split-K partials of the prenorm GEMM, built from the torch reference.
+
+    That GEMM now lives in DeepGEMM, so the reduce/rmsnorm operator is driven
+    by reference GEMM outputs: one partial per split of the reduction
+    dimension, matching what the split-K GEMM used to produce.
+    """
+    mhc_mult3, mhc_hidden_size = fn.shape
+    num_tokens = residual.shape[0] * residual.shape[1]
+    split_size = mhc_hidden_size // n_splits
+
+    x_flat = residual.float().flatten(2, 3).reshape(num_tokens, mhc_hidden_size)
+    out_mul = torch.empty(n_splits, num_tokens, 1, mhc_mult3, dtype=torch.float32, device=residual.device)
+    sqrsum = torch.empty(n_splits, num_tokens, 1, dtype=torch.float32, device=residual.device)
+    for i in range(n_splits):
+        x_split = x_flat[:, i * split_size : (i + 1) * split_size].unsqueeze(1)
+        fn_split = fn[:, i * split_size : (i + 1) * split_size].unsqueeze(1)
+        out_mul[i] = torch.einsum('mbk,nbk->mbn', x_split, fn_split)
+        sqrsum[i] = x_split.square().sum(-1)
+    return out_mul, sqrsum

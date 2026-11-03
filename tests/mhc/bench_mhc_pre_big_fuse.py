@@ -3,33 +3,32 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""
-mhc_pre_big_fuse 性能基准：
-  - 主计时默认 CUDA Graph：capture + replay（降低 Python/host launch 开销；PyTorch 可将图中 cudaMalloc 等纳入捕获，未必依赖改源码）。
-  - Profiler 分项仍为「普通 eager 单次 forward」下的 GPU self-time（见下文）。
+"""Benchmark the upstream pre_big_fuse stage with precomputed GEMM partials.
 
-与 tests/mhc/test_pre_big_fuse.py 相同的 generate_big_fuse_test_data / 调用方式；
-分桶逻辑参考 Jenga 的 profiler_kernel_time_and_buckets_ms。
+The prenorm GEMM is external to TileKernels v2. It is prepared before timing
+using the same reference helper as test_pre_big_fuse.py. Both CUDA event/graph
+measurements and eager profiler buckets cover only the fused stage, not the
+old end-to-end GEMM + pre_big_fuse pipeline. Output buffers are preallocated.
 
-Profiler 分项（bucket）为何不用 graph：
-  - graph replay 时常只见 cudaGraphLaunch / 聚合节点，难以稳定拆解各 TileLang kernel；故分项始终对同一套数据的 eager ``fwd_fn()`` 做 profile。
-
-Usage:
-  cd /path/to/TileKernels
-  python benchmark/bench_mhc_pre_big_fuse.py --device cuda:0
-  python benchmark/bench_mhc_pre_big_fuse.py --no-cuda-graph   # 仅用 CUDA Events 包 eager forward
+Usage (from the repository root):
+  python -m tests.mhc.bench_mhc_pre_big_fuse --device cuda:0
+  python tests/mhc/bench_mhc_pre_big_fuse.py --no-cuda-graph
 """
 
 from __future__ import annotations
 
 import argparse
 import statistics
+import sys
+from pathlib import Path
+
+# Support direct execution as well as python -m from the repository root.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
 from torch.profiler import ProfilerActivity, profile
-from tilelang.profiler import do_bench_cudagraph
-
-from tile_kernels.modeling.mhc.ops import mhc_pre_big_fuse
+from tests.mhc.test_pre_big_fuse import make_big_fuse_runner, make_gemm_partials
 
 
 def generate_big_fuse_test_data(
@@ -42,11 +41,11 @@ def generate_big_fuse_test_data(
     mhc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 10,
     n_splits: int = 16,
+    device: str = "cuda",
 ) -> dict[str, torch.Tensor | float]:
     n0 = 1
     mhc_mult2 = mhc_mult * mhc_mult
     mhc_mult3 = mhc_mult * 2 + mhc_mult2
-    device = "cuda"
 
     residual = (
         torch.randn((n0, n1, mhc_mult, hidden_size), dtype=torch.float, device=device)
@@ -77,23 +76,10 @@ def generate_big_fuse_test_data(
     }
 
 
-# Profiler key 中常见的 TileLang 内核名子串（顺序：先匹配更具体的 split-k，再 GEMM，最后融合大核）
-DEFAULT_TILELANG_KERNEL_SUBSTRS: tuple[str, ...] = (
-    "mhc_pre_gemm_sqrsum_splitk_stage_0",
-    "mhc_pre_gemm_sqrsum_splitk_stage_1",
-    "_mhc_pre_norm_fn_fwd_mul_kernel",
-    "mhc_pre_big_fuse",
-    "_round_to_tf32_prim",
-)
-
-# 与 pre_big_fuse.py / tile_kernels/mhc 中 prim_func 命名一致；首匹配分桶
-PROFILER_BUCKETS: tuple[tuple[str, str], ...] = (
-    ("fwd_mul_splitk_s0", "mhc_pre_gemm_sqrsum_splitk_stage_0"),
-    ("fwd_mul_splitk_s1", "mhc_pre_gemm_sqrsum_splitk_stage_1"),
-    ("fwd_mul_gemm", "_mhc_pre_norm_fn_fwd_mul_kernel"),
-    ("big_fuse", "mhc_pre_big_fuse"),
-    ("round_to_tf32", "_round_to_tf32_prim"),
-)
+# The upstream API times only the fused stage; removed GEMM/split-K kernels
+# must not appear as zero-valued buckets suggesting they were measured.
+DEFAULT_TILELANG_KERNEL_SUBSTRS: tuple[str, ...] = ("mhc_pre_big_fuse",)
+PROFILER_BUCKETS: tuple[tuple[str, str], ...] = (("big_fuse", "mhc_pre_big_fuse"),)
 
 
 def cuda_timer_eager(fn, warmup=10, repeat=50, device="cuda"):
@@ -267,80 +253,72 @@ def benchmark_one_shape(
     kernel_substrs: tuple[str, ...] | None,
     use_cuda_graph: bool,
 ) -> None:
-    td = generate_big_fuse_test_data(n1=n1, mhc_mult=mhc_mult, hidden_size=hidden_size)
+    with torch.cuda.device(device):
+        td = generate_big_fuse_test_data(n1=n1, mhc_mult=mhc_mult, hidden_size=hidden_size, device=device)
+        # GEMM reference work and output allocations are outside every timed region.
+        gemm_out_mul, gemm_out_sqrsum = make_gemm_partials(td["residual"], td["fn"], td["n_splits"])
+        post_mix, comb_mix, layer_input, fwd_fn = make_big_fuse_runner(gemm_out_mul, gemm_out_sqrsum, td)
+        # Compile before graph capture; keep outputs alive throughout timing.
+        fwd_fn()
 
-    def fwd_fn() -> None:
-        mhc_pre_big_fuse(
-            td["residual"],
-            td["fn"],
-            td["mhc_scale"],
-            td["mhc_base"],
-            rms_eps=td["rms_eps"],
-            mhc_pre_eps=td["mhc_pre_eps"],
-            mhc_sinkhorn_eps=td["mhc_sinkhorn_eps"],
-            mhc_post_mult_value=td["mhc_post_mult_value"],
-            sinkhorn_repeat=td["sinkhorn_repeat"],
-            n_splits=td["n_splits"],
-        )
-
-    evt_label = "CUDA graph replay (tilelang do_bench_cudagraph, mean)"
-    if use_cuda_graph:
-        try:
-            with torch.cuda.device(device):
-                evt_mean = float(do_bench_cudagraph(fwd_fn))
-            evt_min = evt_max = evt_mean
-        except RuntimeError as e:
-            print(f"    [warn] CUDAGraph 捕获失败，回退 eager Events: {e}")
+        evt_label = "CUDA graph replay (fused stage only)"
+        if use_cuda_graph:
+            try:
+                evt_mean, evt_min, evt_max = cuda_timer_cudagraph(
+                    fwd_fn, warmup=warmup, repeat=repeat, device=device
+                )
+            except RuntimeError as e:
+                print(f"    [warn] CUDAGraph 捕获失败，回退 eager Events: {e}")
+                evt_mean, evt_min, evt_max = cuda_timer_eager(
+                    fwd_fn, warmup=warmup, repeat=repeat, device=device
+                )
+                evt_label = "CUDA events (eager, fallback)"
+        else:
             evt_mean, evt_min, evt_max = cuda_timer_eager(
                 fwd_fn, warmup=warmup, repeat=repeat, device=device
             )
-            evt_label = "CUDA events (eager, fallback)"
-    else:
-        evt_mean, evt_min, evt_max = cuda_timer_eager(
-            fwd_fn, warmup=warmup, repeat=repeat, device=device
+            evt_label = "CUDA events (eager)"
+
+        prof_total, bucks = profiler_kernel_time_and_buckets_ms(
+            fwd_fn,
+            warmup=warmup,
+            repeat=profiler_repeat,
+            device=device,
+            name_substrs=kernel_substrs,
+            breakdown_buckets=PROFILER_BUCKETS,
         )
-        evt_label = "CUDA events (eager)"
 
-    prof_total, bucks = profiler_kernel_time_and_buckets_ms(
-        fwd_fn,
-        warmup=warmup,
-        repeat=profiler_repeat,
-        device=device,
-        name_substrs=kernel_substrs,
-        breakdown_buckets=PROFILER_BUCKETS,
-    )
+        num_tokens = n1
+        mhc_hs = mhc_mult * hidden_size
+        print()
+        print(f"  shape n1={n1} hidden={hidden_size} mhc_mult={mhc_mult}  "
+              f"(num_tokens={num_tokens}, mhc_hidden_size={mhc_hs})")
+        print(
+            f"    {evt_label} (ms): mean={evt_mean:.3f}  min={evt_min:.3f}  max={evt_max:.3f}"
+        )
+        filter_note = "全部命中子串的 GPU self-time 之和" if kernel_substrs else "窗口内全部 GPU self-time"
+        print(
+            f"    Profiler total ({filter_note}, eager forward) (ms): mean={prof_total[0]:.3f}  "
+            f"min={prof_total[1]:.3f}  max={prof_total[2]:.3f}"
+        )
+        if bucks:
+            order = [n for n, _ in PROFILER_BUCKETS] + ["other"]
+            parts = []
+            for name in order:
+                if name not in bucks:
+                    continue
+                m, mn, mx = bucks[name]
+                if m > 1e-9 or name == "other":
+                    parts.append(f"{name}={m:.3f}")
+            print(f"    Profiler buckets mean (ms, eager):  {'  '.join(parts)}")
 
-    num_tokens = n1
-    mhc_hs = mhc_mult * hidden_size
-    print()
-    print(f"  shape n1={n1} hidden={hidden_size} mhc_mult={mhc_mult}  "
-          f"(num_tokens={num_tokens}, mhc_hidden_size={mhc_hs})")
-    print(
-        f"    {evt_label} (ms): mean={evt_mean:.3f}  min={evt_min:.3f}  max={evt_max:.3f}"
-    )
-    filter_note = "全部命中子串的 GPU self-time 之和" if kernel_substrs else "窗口内全部 GPU self-time"
-    print(
-        f"    Profiler total ({filter_note}, eager forward) (ms): mean={prof_total[0]:.3f}  "
-        f"min={prof_total[1]:.3f}  max={prof_total[2]:.3f}"
-    )
-    if bucks:
-        order = [n for n, _ in PROFILER_BUCKETS] + ["other"]
-        parts = []
-        for name in order:
-            if name not in bucks:
-                continue
-            m, mn, mx = bucks[name]
-            if m > 1e-9 or name == "other":
-                parts.append(f"{name}={m:.3f}")
-        print(f"    Profiler buckets mean (ms, eager):  {'  '.join(parts)}")
-
-    del td
-    torch.cuda.empty_cache()
+        del fwd_fn, post_mix, comb_mix, layer_input, gemm_out_mul, gemm_out_sqrsum, td
+        torch.cuda.empty_cache()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Bench mhc_pre_big_fuse: wall-clock vs profiler TileLang kernel buckets."
+        description="Bench upstream mhc_pre_big_fuse: fused stage only; GEMM preparation excluded."
     )
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--warmup", type=int, default=10)
@@ -376,6 +354,14 @@ def main() -> None:
         help="主计时不用 CUDAGraph，改用 CUDA Events 包 eager forward（与早期脚本一致）",
     )
     args = parser.parse_args()
+    if args.warmup < 0 or args.repeat <= 0 or args.profiler_repeat <= 0:
+        parser.error("warmup must be non-negative; repeat and profiler-repeat must be positive")
+    if (args.n1 is None) != (args.hidden_size is None):
+        parser.error("--n1 and --hidden-size must be provided together")
+    if (args.n1 is not None and args.n1 <= 0) or (args.hidden_size is not None and args.hidden_size <= 0) or args.mhc_mult <= 0:
+        parser.error("shape dimensions must be positive")
+    if torch.device(args.device).type != "cuda":
+        parser.error("--device must select a CUDA/HCU device")
 
     if not torch.cuda.is_available():
         raise SystemExit("需要 CUDA")
@@ -387,7 +373,7 @@ def main() -> None:
         substrs = tuple(dict.fromkeys(list(DEFAULT_TILELANG_KERNEL_SUBSTRS) + extra))
 
     print("=" * 96)
-    print("  mhc_pre_big_fuse — CUDA events vs Profiler (TileLang kernels)")
+    print("  mhc_pre_big_fuse — fused stage only (GEMM precomputed, output buffers reused)")
     print(f"  Device: {args.device}")
     try:
         idx = torch.device(args.device).index
@@ -437,7 +423,7 @@ def main() -> None:
 
     print()
     print("=" * 96)
-    print("  说明: fwd_mul_* = pre-norm GEMM；big_fuse = pre_big_fuse_kernel；Profiler 分项仅 eager。")
+    print("  说明: GEMM partials 在计时前生成；big_fuse = 上游融合阶段；Profiler 分项仅 eager。")
     print("  other = 未命中子串的 GPU 时间；可加 --kernel-substr；主计时默认 CUDAGraph 可用 --no-cuda-graph 关闭")
     print("=" * 96)
 

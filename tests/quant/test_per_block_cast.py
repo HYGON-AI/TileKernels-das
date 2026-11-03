@@ -3,10 +3,12 @@ import pytest
 import torch
 
 import tile_kernels
-from tile_kernels.testing.bench import dtype_to_str, make_param_id
+from tile_kernels.testing.bench import make_param_id
+from tile_kernels.utils import str_to_dtype
 from tile_kernels.testing.numeric import assert_equal, count_bytes, check_bias
-from tile_kernels.testing.generator import generate_hidden_sizes, generate_num_tokens
+from tile_kernels.testing.generator import generate_cast_config, generate_hidden_sizes, generate_num_tokens, generate_rand_float, get_test_level
 from tile_kernels.testing.quant import clear_unused_sf
+from tile_kernels.config import is_ascend, is_hcu
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
@@ -22,9 +24,11 @@ def generate_test_data(params):
     round_sf = params['round_sf']
     use_packed_ue8m0 = params['use_packed_ue8m0']
 
-    x = torch.randn((num_tokens, hidden), dtype=in_dtype, device='cuda')
+    x = generate_rand_float((num_tokens, hidden)).to(str_to_dtype(in_dtype))
     base_args = dict(
-        x=x, fmt=fmt, block_size=block_size,
+        x=x,
+        fmt=fmt,
+        block_size=block_size,
         use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
         round_sf=round_sf,
         use_packed_ue8m0=use_packed_ue8m0,
@@ -33,7 +37,7 @@ def generate_test_data(params):
     return (x, base_args)
 
 
-def generate_test_params(is_benchmark: bool) -> list[dict]:
+def generate_test_params(level: int) -> list[dict]:
     return [
         {
             'num_tokens': num_tokens,
@@ -45,32 +49,38 @@ def generate_test_params(is_benchmark: bool) -> list[dict]:
             'use_packed_ue8m0': use_packed_ue8m0,
             'block_size': block_size,
         }
-        for num_tokens in generate_num_tokens(is_benchmark=is_benchmark)
-        for hidden_size in generate_hidden_sizes()
-        for in_dtype in (torch.bfloat16, torch.float32)
+        for num_tokens in generate_num_tokens(level, alignment=128)
+        for hidden_size in generate_hidden_sizes(128)
+        for in_dtype in ('bf16', 'fp32')
         for fmt in ('e4m3', 'e2m1')
-        for use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0 in [(False, True, False), (True, True, True)]
-        for block_size in ((128, 128), (32, 32))
+        for use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0 in ([(False, True, False)] if level == 0 else generate_cast_config(level, fmt))
+        for block_size in (((32, 32),) if is_ascend() else ((128, 128), (32, 32), (128, 32), (32, 128)))
     ]
 
 
-@pytest.mark.parametrize('params', generate_test_params(is_benchmark=False), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_test_params(get_test_level()), ids=make_param_id)
 def test_per_block_cast(params):
-    fmt = params['fmt']
     hidden = params['hidden']
     use_tma_aligned_col_major_sf = params['use_tma_aligned_col_major_sf']
     use_packed_ue8m0 = params['use_packed_ue8m0']
     block_size = params['block_size']
-    is_hcu = torch.version.hip is not None
-
-    if fmt == 'e2m1' and is_hcu:
-        pytest.skip('Skip e2m1 per_block_cast on HCU')
 
     x, base_args = generate_test_data(params)
 
     # Test cast
     x_casted, per_block_sf_inv = tile_kernels.quant.per_block_cast(**base_args)
     x_casted_ref, per_block_sf_inv_ref = tile_kernels.torch.cast(**base_args)
+
+    # Test pre-allocated data and SF outputs
+    if not use_tma_aligned_col_major_sf and not use_packed_ue8m0:
+        out_x_buffer = torch.empty_like(x_casted)
+        out_sf_buffer = torch.empty_like(per_block_sf_inv)
+        out_x, out_sf = tile_kernels.quant.per_block_cast(**base_args, out=(out_x_buffer, out_sf_buffer))
+        assert out_x.data_ptr() == out_x_buffer.data_ptr()
+        assert out_sf.data_ptr() == out_sf_buffer.data_ptr()
+        assert_equal(out_x, x_casted)
+        assert_equal(out_sf, per_block_sf_inv)
+
     x_casted_back = tile_kernels.torch.cast_back((x_casted, per_block_sf_inv), 'fp32', block_size)
     if use_packed_ue8m0:
         per_block_sf_inv = clear_unused_sf(per_block_sf_inv, hidden, block_size[1])
@@ -95,15 +105,21 @@ def test_per_block_cast(params):
     assert_equal(twice_per_block_sf_inv, per_block_sf_inv_ref)
 
 
+@pytest.mark.skipif(not is_hcu(), reason='HCU reciprocal literal precision')
+@pytest.mark.parametrize('exponent', [-100, 0, 100])
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
+def test_per_block_fp4_scale_power_boundary(exponent, dtype):
+    x = torch.full((128, 128), 6.0 * 2**exponent, dtype=dtype, device='cuda')
+    quantized, sf = tile_kernels.quant.per_block_cast(x, 'e2m1', (32, 32), round_sf=True)
+    torch.testing.assert_close(sf, torch.full_like(sf, 2.0**exponent), rtol=0, atol=0)
+    assert torch.equal(quantized, torch.full_like(quantized, 0x77))
+    restored = tile_kernels.torch.cast_back((quantized, sf), 'fp32', (32, 32))
+    torch.testing.assert_close(restored, x.float(), rtol=0, atol=0)
+
+
 @pytest.mark.benchmark
-@pytest.mark.parametrize('params', generate_test_params(is_benchmark=True), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_test_params(0), ids=make_param_id)
 def test_per_block_cast_benchmark(benchmark_timer, benchmark_record, params):
-    fmt = params['fmt']
-    is_hcu = torch.version.hip is not None
-
-    if fmt == 'e2m1' and is_hcu:
-        pytest.skip('Skip e2m1 per_block_cast benchmark on HCU')
-
     x, args = generate_test_data(params)
 
     x_casted, per_block_sf_inv = tile_kernels.quant.per_block_cast(**args)
@@ -111,7 +127,6 @@ def test_per_block_cast_benchmark(benchmark_timer, benchmark_record, params):
     t_us = benchmark_timer(lambda: tile_kernels.quant.per_block_cast(**args))
     num_bytes = count_bytes(x, x_casted, per_block_sf_inv)
 
-    params['in_dtype'] = dtype_to_str(params['in_dtype'])
     benchmark_record(
         kernel='per_block_cast',
         operation='fwd',

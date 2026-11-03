@@ -1,15 +1,43 @@
 import os
+
 import pytest
 import torch
 
+from tile_kernels.config import get_device, is_ascend, is_hcu
 from tile_kernels.engram import engram_gate_fwd
-from tile_kernels.torch.engram import engram_gate_ref, engram_gate_ref_tilelang_reduction_order
-from tile_kernels.testing.numeric import assert_equal, calc_diff, count_bytes
-from tile_kernels.testing.generator import generate_hidden_sizes, generate_num_tokens
+from tile_kernels.rand import randn
 from tile_kernels.testing.bench import make_param_id
+from tile_kernels.testing.generator import generate_hidden_sizes, generate_num_tokens, get_test_level
+from tile_kernels.testing.numeric import assert_equal, count_bytes
+from tile_kernels.torch.engram import engram_gate_ref
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
+
+
+
+def _raw_dot_reference_fp64(hidden_states: torch.Tensor, kv: torch.Tensor, weight_fused: torch.Tensor) -> torch.Tensor:
+    """Independent raw-dot reference, with bounded temporary memory.
+
+    HIP BLAS FP32 dot accumulation can lose more precision than the kernel
+    when large terms cancel. Keep the existing comparison tolerance and use
+    FP64 accumulation for this check instead of changing kernel arithmetic.
+    """
+    dot = torch.empty(hidden_states.shape[:-1], dtype=torch.float32, device=hidden_states.device)
+    weight = weight_fused.double()
+    for start in range(0, hidden_states.shape[0], 256):
+        stop = start + 256
+        x = hidden_states[start:stop].double()
+        k = kv[start:stop, :hidden_states.shape[1]].double()
+        dot[start:stop] = (x * k * weight).sum(-1).float()
+    return dot
+
+
+def test_engram_dot_reference_cancellation():
+    x = torch.tensor([[[1e8, 1.0, -1e8, 2.0]]], dtype=torch.bfloat16)
+    kv = torch.ones((1, 2, 4), dtype=torch.bfloat16)
+    weight = torch.ones((1, 4), dtype=torch.float32)
+    assert_equal(_raw_dot_reference_fp64(x, kv, weight), torch.tensor([[3.0]]))
 
 
 def generate_test_data(params):
@@ -18,128 +46,125 @@ def generate_test_data(params):
     hidden_size = params['hidden']
     eps = 1e-20
     clamp_value = 1e-6
-    x_data = torch.randn(num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device='cuda')
-    k_data = torch.randn(num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device='cuda')
-    v_data = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device='cuda')
-    wh_data = torch.randn(hc_mult, hidden_size, dtype=torch.bfloat16, device='cuda')
-    we_data = torch.randn(hc_mult, hidden_size, dtype=torch.bfloat16, device='cuda')
+    device = get_device()
+    x_data = randn(num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=device)
+    kv_data = randn(num_tokens, hc_mult + 1, hidden_size, dtype=torch.bfloat16, device=device)
+    wh_data = randn(hc_mult, hidden_size, dtype=torch.bfloat16, device=device)
+    we_data = randn(hc_mult, hidden_size, dtype=torch.bfloat16, device=device)
     weight_fused = wh_data.float() * we_data.float()
-    return (x_data, k_data, v_data, wh_data, we_data, weight_fused, eps, clamp_value)
+    image_token_mask = (torch.arange(num_tokens, device=device) % 4 < 2) if params['with_mask'] else None
+    return (x_data, kv_data, wh_data, we_data, weight_fused, eps, clamp_value, image_token_mask)
 
 
-def generate_test_params(is_benchmark: bool) -> list[dict]:
+def generate_test_params(level: int, mask_options: tuple[bool, ...] = (False, True)) -> list[dict]:
     return [
-        {'num_tokens': t, 'hc': hc, 'hidden': hidden_size}
-        for t in generate_num_tokens(is_benchmark=is_benchmark)
+        {'num_tokens': t, 'hc': hc, 'hidden': hidden_size, 'with_mask': with_mask}
+        for t in generate_num_tokens(level)
         for hc in (4,)
-        for hidden_size in generate_hidden_sizes(128)
+        for hidden_size in generate_hidden_sizes(128 if is_ascend() else 256)
+        for with_mask in mask_options
     ]
 
 
-@pytest.mark.parametrize('params', generate_test_params(is_benchmark=False), ids=make_param_id)
-def test_engram_gate_fwd_alg_ref_matches_tilelang_accum_order(params):
-    """Fwd kernel vs Torch ref built with the **same reduction traversal** as TileLang (all grid sizes like ``test_engram_gate_fwd``)."""
-    (
-        x_data,
-        k_data,
-        v_data,
-        _wh,
-        _we,
-        weight_fused,
-        eps,
-        clamp_value,
-    ) = generate_test_data(params)
-
-    out_tl_accum, dot_t, gs_t, rx_t, rk_t = engram_gate_ref_tilelang_reduction_order(
-        x_data, k_data, v_data, weight_fused, clamp_value, eps, save_for_backward=True,
-    )
-    out_k, dot_k, gs_k, rx_k, rk_k = engram_gate_fwd(
-        x_data,
-        k_data,
-        v_data,
-        weight_fused,
-        eps,
-        clamp_value,
-        save_for_backward=True,
-    )
-    for name, a, b in (
-        ('dot', dot_k, dot_t),
-        ('gate_score', gs_k, gs_t),
-        ('rstd_x', rx_k, rx_t),
-        ('rstd_k', rk_k, rk_t),
-        ('out', out_k, out_tl_accum),
-    ):
-        diff = calc_diff(a, b)
-        assert diff < 2e-10, f'tilelang vs accum-order ref mismatch on {name}: {diff:.6e}'
-
-
-@pytest.mark.parametrize('params', generate_test_params(is_benchmark=False), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_test_params(get_test_level()), ids=make_param_id)
 def test_engram_gate_fwd(params):
-    (x_data, k_data, v_data, wh_data, we_data, weight_fused, eps, clamp_value) = generate_test_data(params)
-
+    x_data, kv_data, wh_data, we_data, weight_fused, eps, clamp_value, image_token_mask = generate_test_data(params)
     out_ref, dot_ref, gate_score_ref, rstd_x_ref, rstd_k_ref = engram_gate_ref(
-        x_data, k_data, v_data, wh_data, we_data, clamp_value, eps, save_for_backward=True,
+        x_data,
+        kv_data,
+        wh_data,
+        we_data,
+        clamp_value,
+        eps,
+        save_for_backward=True,
+        image_token_mask=image_token_mask,
     )
 
     # Correctness: save_for_backward=True
     out_save, dot, gate_score, rstd_x, rstd_k = engram_gate_fwd(
-        x_data, k_data, v_data, weight_fused, eps, clamp_value, save_for_backward=True,
+        x_data,
+        kv_data,
+        weight_fused,
+        eps,
+        clamp_value,
+        save_for_backward=True,
+        image_token_mask=image_token_mask,
     )
     assert dot is not None and gate_score is not None and rstd_x is not None and rstd_k is not None
-    diff_out = calc_diff(out_save, out_ref)
-    assert diff_out < 1e-9, f'out_save mismatch: {diff_out:.6e}'
-    diff_dot = calc_diff(dot, dot_ref)
-    assert diff_dot < 1e-9, f'dot mismatch: {diff_dot:.6e}'
-    diff_gate = calc_diff(gate_score, gate_score_ref)
-    assert diff_gate < 1e-9, f'gate_score mismatch: {diff_gate:.6e}'
-    diff_rstd_x = calc_diff(rstd_x, rstd_x_ref)
-    assert diff_rstd_x < 1e-9, f'rstd_x mismatch: {diff_rstd_x:.6e}'
-    diff_rstd_k = calc_diff(rstd_k, rstd_k_ref)
-    assert diff_rstd_k < 1e-9, f'rstd_k mismatch: {diff_rstd_k:.6e}'
+    text_tokens = slice(None) if image_token_mask is None else ~image_token_mask
+    if is_hcu():
+        dot_ref = _raw_dot_reference_fp64(x_data, kv_data, weight_fused)
+    torch.testing.assert_close(out_save, out_ref, rtol=8e-3, atol=8e-3)
+    torch.testing.assert_close(dot[text_tokens], dot_ref[text_tokens], rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(gate_score[text_tokens], gate_score_ref[text_tokens], rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(rstd_x[text_tokens], rstd_x_ref[text_tokens])
+    torch.testing.assert_close(rstd_k[text_tokens], rstd_k_ref[text_tokens])
+
+    if image_token_mask is not None:
+        assert_equal(out_save[image_token_mask], x_data[image_token_mask])
 
     # Correctness: save_for_backward=False
     out_no_save, dot_n, gate_score_n, rstd_x_n, rstd_k_n = engram_gate_fwd(
-        x_data, k_data, v_data, weight_fused, eps, clamp_value, save_for_backward=False,
+        x_data,
+        kv_data,
+        weight_fused,
+        eps,
+        clamp_value,
+        save_for_backward=False,
+        image_token_mask=image_token_mask,
     )
     assert dot_n is None and gate_score_n is None and rstd_x_n is None and rstd_k_n is None
-    diff_out = calc_diff(out_no_save, out_ref)
-    assert diff_out < 1e-9, f'out_no_save mismatch: {diff_out:.6e}'
     assert_equal(out_no_save, out_save)
+
+    # Correctness: inplace=True overwrites hidden_states with the same result
+    x_inplace = x_data.clone()
+    out_inplace = engram_gate_fwd(
+        x_inplace,
+        kv_data,
+        weight_fused,
+        eps,
+        clamp_value,
+        save_for_backward=False,
+        image_token_mask=image_token_mask,
+        inplace=True,
+    )[0]
+    assert_equal(out_inplace, out_save)
 
 
 @pytest.mark.benchmark
-@pytest.mark.parametrize('params', generate_test_params(is_benchmark=True), ids=make_param_id)
+@pytest.mark.parametrize(
+    'params',
+    [{**params, 'save': save} for params in generate_test_params(0, mask_options=(False,)) for save in (False, True)],
+    ids=make_param_id,
+)
 def test_engram_gate_fwd_benchmark(benchmark_timer, benchmark_record, params):
-    (x_data, k_data, v_data, _, _, weight_fused, eps, clamp_value) = generate_test_data(params)
+    (x_data, kv_data, _, _, weight_fused, eps, clamp_value, _) = generate_test_data(params)
+    save_for_backward = params['save']
 
-    # Benchmark save_for_backward=True
-    out_save, dot, gate_score, rstd_x, rstd_k = engram_gate_fwd(
-        x_data, k_data, v_data, weight_fused, eps, clamp_value, save_for_backward=True,
+    out, dot, gate_score, rstd_x, rstd_k = engram_gate_fwd(
+        x_data,
+        kv_data,
+        weight_fused,
+        eps,
+        clamp_value,
+        save_for_backward=save_for_backward,
     )
-    t_save_us = benchmark_timer(lambda: engram_gate_fwd(
-        x_data, k_data, v_data, weight_fused, eps, clamp_value, save_for_backward=True,
-    ))
-    num_bytes_save = count_bytes(x_data, k_data, v_data, weight_fused, out_save, dot, gate_score, rstd_x, rstd_k)
+    t_us = benchmark_timer(
+        lambda: engram_gate_fwd(
+            x_data,
+            kv_data,
+            weight_fused,
+            eps,
+            clamp_value,
+            save_for_backward=save_for_backward,
+        )
+    )
+    num_bytes = count_bytes(x_data, kv_data, weight_fused, out, dot, gate_score, rstd_x, rstd_k)
+
     benchmark_record(
         kernel='engram_gate_fwd',
         operation='fwd',
-        params={**params, 'save': True},
-        time_us=t_save_us,
-        bandwidth_gbs=num_bytes_save / t_save_us / 1e3,
-    )
-
-    # Benchmark save_for_backward=False
-    out_no_save = engram_gate_fwd(
-        x_data, k_data, v_data, weight_fused, eps, clamp_value, save_for_backward=False,
-    )[0]
-    t_no_save_us = benchmark_timer(lambda: engram_gate_fwd(
-        x_data, k_data, v_data, weight_fused, eps, clamp_value, save_for_backward=False,
-    ))
-    num_bytes_no_save = count_bytes(x_data, k_data, v_data, weight_fused, out_no_save)
-    benchmark_record(
-        kernel='engram_gate_fwd',
-        operation='fwd',
-        params={**params, 'save': False},
-        time_us=t_no_save_us,
-        bandwidth_gbs=num_bytes_no_save / t_no_save_us / 1e3,
+        params=params,
+        time_us=t_us,
+        bandwidth_gbs=num_bytes / t_us / 1e3,
     )

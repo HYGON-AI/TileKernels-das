@@ -1,0 +1,119 @@
+{
+  "upstream": {
+    "v2_0": "828cc15d17e2ef4b351c2cb6021de02fde82330e",
+    "main_target": "c1cf914",
+    "das_baseline": "7ee2019866b73d0d47caa25531dad93ec9a14779",
+    "strategy": "merge commits, preserving upstream commit ancestry"
+  },
+  "runtime": {
+    "container": "thuang_dist",
+    "gpu": "physical GPU 0 only, gfx936 BW",
+    "python": "3.10.12",
+    "torch": "2.11.0 HIP 6.3",
+    "tilelang_base": "9f3bbcd37e0955dfd1360501c95c48095d9f9bf8",
+    "test_level": 0
+  },
+  "compiler_patch": {
+    "path": "patches/tilelang-hcu-low-precision-codegen.patch",
+    "sha256": "e16ca716041c03e0357dd5b26fadee20c4daab6767ce287902cc25a1972cc785",
+    "regression_cases_passed": 17,
+    "clean_base_apply_check": true,
+    "scope": [
+      "FP4/FP8 numeric casts and packed accesses",
+      "wide integer/index/vector code generation",
+      "precise floating-point literals",
+      "BF16/FP8/FP4 stochastic rounding"
+    ],
+    "unrelated_distributed_changes_included": false
+  },
+  "kernel_review": [
+    {
+      "scope": "Engram forward/backward and reload",
+      "decision": "preserve DAS HCU wave layouts, compiler flags, reload synchronization and image masks while adopting upstream packed KV API",
+      "evidence": "full forward/backward tests; original DAS same-input comparison"
+    },
+    {
+      "scope": "mHC pre_big_fuse and recompute",
+      "decision": "retain HCU launch/layout and arithmetic controls; use synchronous HCU copies for recompute",
+      "evidence": "pre_big_fuse30 and recompute17 tests passed; decomposition and original DAS comparisons"
+    },
+    {
+      "scope": "MoE routing",
+      "decision": "use HCU Philox and logical warp32 routing primitives",
+      "evidence": "known-answer routing primitives and forward/backward tests"
+    },
+    {
+      "scope": "norm backward",
+      "decision": "separate HCU implementation with wave64, explicit LDS handoff, capacity-aware staging and a second weight-gradient reduction kernel",
+      "evidence": "42 cases including tail tokens, strides, residual gradient and FP32 accumulation"
+    },
+    {
+      "scope": "batched scaling-factor transpose",
+      "decision": "HCU descriptors use flattened static capacity",
+      "evidence": "exact output-byte comparisons"
+    },
+    {
+      "scope": "generic cast and rope",
+      "decision": "select HCU target automatically; generic cast keeps upstream stochastic T.cast API",
+      "evidence": "243 generic cast cases and 132 rope cases passed"
+    },
+    {
+      "scope": "SwiGLU backward",
+      "decision": "disable CUDA-only PTX prefetch and occupancy annotation on HCU; computation formulas unchanged",
+      "evidence": "33 production cases and 4 old DAS same-input comparisons passed"
+    },
+    {
+      "scope": "SwiGLU forward",
+      "decision": "disable CUDA-only PTX prefetch and use hardware wave64 for HCU IDs and reductions",
+      "evidence": "44 production cases, 4 old DAS exact comparisons and 12 persistent-loop/wave boundary cases passed"
+    },
+    {
+      "scope": "high-repeat Sinkhorn backward",
+      "decision": "restore existing DAS bounded-cache kernel on HCU for repeat>10",
+      "source_commit": "b18ef07005a3c5f52152119276fa40c5da997b52",
+      "core_function_ast_identical_to_DAS": true,
+      "evidence": "8 same-input/autograd comparisons and 18 production tests passed; repeat64 upstream launch fails with its 81920-byte cache"
+    }
+  ],
+  "reference_review": [
+    {
+      "scope": "Engram forward raw dot",
+      "decision": "use chunked FP64 accumulation for HCU reference, retaining original tolerance"
+    },
+    {
+      "scope": "Engram backward",
+      "decision": "compare BF16 output against unrounded FP32 reference gradient and assert output dtype, retaining original tolerances",
+      "reason": "original DAS and new kernel agreed; FP32 reference rounding at a BF16 midpoint caused a false failure"
+    },
+    {
+      "scope": "SwiGLU reference FMA",
+      "decision": "use native torch.addcmul on HCU to make fused FP32 rounding independent of Inductor shape specialization",
+      "evidence": "known cancellation answer -2^-46 and original failing sequence pass; kernel math unchanged"
+    }
+  ],
+  "preserved_DAS_tests": [
+    "tests/mhc/test_hc_split_sinkhorn.py",
+    "tests/mhc/bench_mhc_pre_big_fuse.py"
+  ],
+  "baseline_results": {
+    "critical_output_sets_bitwise_equal": 24,
+    "per_token_cast_cases_bitwise_equal": 16,
+    "swiglu_backward_cases_passed": 4,
+    "swiglu_forward_cases_bitwise_equal": 4,
+    "high_repeat_sinkhorn_cases_bitwise_equal": 8,
+    "benchmark_smoke": "eager and graph CLI passed without graph fallback; profiler recorded fused kernel"
+  },
+  "validation": {
+    "v2_0_recorded_coverage": {
+      "files": 35,
+      "correctness_cases": 2938,
+      "missing_passing_records": 0,
+      "benchmark_cases_not_run": 2680
+    },
+    "status": "v2.0 scope covered; main merge and final fresh-cache sweep pending"
+  },
+  "default_scope": {
+    "TK_TEST_LEVEL": 0,
+    "very_large_6_44G_element_cast_cases": "explicit level2 only, per user instruction"
+  }
+}

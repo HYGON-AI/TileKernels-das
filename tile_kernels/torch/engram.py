@@ -1,6 +1,99 @@
 import torch
 
-from tile_kernels.engram.engram_gate_kernel import _choose_engram_fwd_threads_vec_size
+from tile_kernels.config import is_ascend
+
+
+def engram_sinkhorn_momentum_update_ref(
+    grad: torch.Tensor,
+    momentum_buffer: torch.Tensor,
+    beta1: float,
+    nesterov: bool = True,
+) -> torch.Tensor:
+    """Pure PyTorch reference implementation of EngramSinkhorn momentum update.
+
+    Updates ``momentum_buffer`` in-place and returns the fp32 tensor consumed by
+    Sinkhorn normalization.
+
+    Args:
+        grad: Gradient tensor of shape (numel,), bfloat16 or float32.
+        momentum_buffer: Momentum buffer of shape (numel,), bfloat16 or float32. Updated in-place.
+        beta1: Momentum decay coefficient.
+        nesterov: If True, return Nesterov-style lookahead; otherwise return fp32-style momentum.
+
+    Returns:
+        Sinkhorn input tensor of shape (numel,), float32.
+    """
+    grad_fp32 = grad.to(torch.float32)
+    momentum_buffer_fp32 = momentum_buffer.to(torch.float32)
+    scaled_grad = grad_fp32 * (1 - beta1)
+    momentum_buffer_fp32 = scaled_grad.add(momentum_buffer_fp32, alpha=beta1)
+    momentum_buffer.copy_(momentum_buffer_fp32)
+
+    if nesterov:
+        if is_ascend():
+            return scaled_grad.add_(momentum_buffer_fp32, alpha=beta1)
+        return (momentum_buffer_fp32 * beta1).add_(grad_fp32, alpha=1 - beta1)
+    return momentum_buffer_fp32
+
+
+def engram_sinkhorn_step_ref(
+    matrix: torch.Tensor,
+    row_scale: torch.Tensor,
+    col_scale: torch.Tensor,
+    col_sumsq: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Pure PyTorch reference for one Engram Sinkhorn row-normalization step.
+
+    Args:
+        matrix: Base matrix of shape (num_rows, head_dim), float32.
+        row_scale: Per-row scale of shape (num_rows,), float32. Updated in-place.
+        col_scale: Per-column scale of shape (head_dim,), float32.
+        col_sumsq: Per-column sums of squares of the normalized iterate, shape (head_dim,), float32.
+        eps: Epsilon added to each row norm for numerical stability.
+
+    Returns:
+        ``row_norm`` of shape (num_rows,), float32: each row's L2 norm before normalization.
+    """
+    iterate = row_scale.unsqueeze(1) * matrix * col_scale
+    row_norm = torch.norm(iterate, p=2, dim=1)
+    row_scale.div_(row_norm + eps)
+    new_iterate = row_scale.unsqueeze(1) * matrix * col_scale
+    col_sumsq.copy_(new_iterate.square().sum(dim=0))
+    return row_norm
+
+
+def engram_sinkhorn_finalize_ref(
+    matrix: torch.Tensor,
+    row_scale: torch.Tensor,
+    col_scale: torch.Tensor,
+    eps: float,
+    alpha: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pure PyTorch reference for materializing the final Sinkhorn matrix.
+
+    Args:
+        matrix: Base matrix of shape (num_rows, head_dim), float32.
+        row_scale: Per-row scale of shape (num_rows,), float32.
+        col_scale: Per-column scale of shape (head_dim,), float32.
+        eps: Epsilon added to each row norm for numerical stability.
+        alpha: Scalar applied after row normalization.
+        out: Optional pre-allocated output tensor with the same shape, dtype as ``matrix``.
+
+    Returns:
+        Final row-normalized matrix of shape (num_rows, head_dim), float32,
+        scaled by ``alpha``.
+    """
+    iterate = row_scale.unsqueeze(1) * matrix * col_scale
+    row_norm = torch.norm(iterate, p=2, dim=1)
+    new_row_scale = row_scale / (row_norm + eps)
+    result = alpha * new_row_scale.unsqueeze(1) * matrix * col_scale
+    if out is None:
+        return result
+
+    out.copy_(result)
+    return out
 
 
 def make_offsets(vocab_sizes: torch.Tensor) -> torch.Tensor:
@@ -27,6 +120,7 @@ def engram_hash_ref(
     multipliers: torch.Tensor,
     vocab_sizes: torch.Tensor,
     offsets: torch.Tensor,
+    image_token_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pure PyTorch reference implementation of engram hash.
 
@@ -37,6 +131,7 @@ def engram_hash_ref(
             (num_ngram_layers, max_ngram_size - 1, num_embed_table_per_ngram), int32.
         offsets: Per-layer embedding table offsets of shape
             (num_ngram_layers, (max_ngram_size - 1) * num_embed_table_per_ngram), int32.
+        image_token_mask: Optional, ``True`` stands for image tokens, shape (num_tokens,), bool.
 
     Returns:
         Embedding indices of shape (num_ngram_layers, num_tokens, (max_ngram_size - 1) * num_embed_table_per_ngram), int32.
@@ -56,19 +151,21 @@ def engram_hash_ref(
     for layer_idx in range(num_ngram_layers):
         ans[layer_idx] = torch.cat(ans[layer_idx], dim=-1)
 
-    output = torch.stack(ans, dim=0)
-    return output + offsets.unsqueeze(1)
+    output = torch.stack(ans, dim=0) + offsets.unsqueeze(1)
+    if image_token_mask is not None:
+        output = output.masked_fill(image_token_mask.view(1, -1, 1), -1)
+    return output
 
 
 def engram_gate_ref(
     hidden_states: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    kv: torch.Tensor,
     weight_hidden: torch.Tensor,
     weight_embed: torch.Tensor,
     clamp_value: float,
     eps: float,
     save_for_backward: bool = False,
+    image_token_mask: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pure PyTorch reference implementation of engram gate (vectorized, supports autograd).
 
@@ -76,20 +173,23 @@ def engram_gate_ref(
 
     Args:
         hidden_states: Input of shape (num_tokens, hc_mult, hidden_size), bfloat16.
-        k: Key embeddings of shape (num_tokens, hc_mult, hidden_size), bfloat16.
-        v: Value embeddings of shape (num_tokens, hidden_size), bfloat16.
+        kv: Packed key/value embeddings of shape (num_tokens, (hc_mult + 1), hidden_size), bfloat16.
         weight_hidden: RMSNorm weight for hidden states, shape (hc_mult, hidden_size), bfloat16.
         weight_embed: RMSNorm weight for key embeddings, shape (hc_mult, hidden_size), bfloat16.
         clamp_value: Clamp threshold for signed-sqrt gate activation.
         eps: Epsilon for RMSNorm numerical stability.
         save_for_backward: If True, also return (dot, gate_score, rstd_x, rstd_k).
+        image_token_mask: Optional, ``True`` stands for image tokens, shape (num_tokens,), bool.
 
     Returns:
         If save_for_backward is False: output tensor of shape (num_tokens, hc_mult, hidden_size), bfloat16.
         If save_for_backward is True: tuple of (output, dot, gate_score, rstd_x, rstd_k).
     """
-    hidden_size = hidden_states.shape[-1]
+    _, hc_mult, hidden_size = hidden_states.shape
     scalar = hidden_size**-0.5
+
+    k = kv[:, :hc_mult, :]
+    v = kv[:, hc_mult, :]
 
     x = hidden_states.float()
     k_f = k.float()
@@ -109,120 +209,8 @@ def engram_gate_ref(
 
     output = x + gate_score.unsqueeze(-1) * v.unsqueeze(-2)
     output = output.bfloat16()
-
-    if save_for_backward:
-        return output, raw_dot, gate_score, rstd_x, rstd_k
-    return output
-
-
-def _choose_engram_fwd_blk_d(hidden_size: int) -> int:
-    """Match ``get_engram_gate_fwd_kernel::_choose_blk_d`` (must stay in sync)."""
-    for blk in (1024, 768, 512, 256):
-        if hidden_size % blk == 0 and hidden_size >= 2 * blk:
-            return blk
-    raise ValueError(f'No valid blk_d for hidden_size={hidden_size}')
-
-
-def engram_gate_ref_tilelang_reduction_order(
-    hidden_states: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    weight_fused: torch.Tensor,
-    clamp_value: float,
-    eps: float,
-    save_for_backward: bool = False,
-) -> tuple[torch.Tensor, ...]:
-    """Reference matched to ``engram_gate_fwd_kernel`` reduction **traversal**, not bitwise exact.
-
-    - Loads bf16 ``x``, ``k``, ``v`` to fp32 like the TileLang loads.
-    - Uses ``weight_fused`` fp32 triple products ``Σ x*w*k`` in the same per-tile traversal as the
-      fwd kernel (``blk_d`` choice, chunk order ``i_b``, ``sub_blks``, serial ``vec``, then warp
-      partials summed in lane order ``0..threads-1``).
-    - ``threads`` / ``vec_size`` follow ``_choose_engram_fwd_threads_vec_size`` (HIP wave64 vs CUDA).
-    - **Caveat:** real ``warp_reduce_sum`` lowers to a shuffle tree; here we sequential-add lane
-      partials. Tiny gaps may remain if the compiler uses a non-associative reduce order.
-
-    Args:
-        Same contract as ``engram_gate_fwd`` plus ``save_for_backward`` like ``engram_gate_ref``.
-
-    Returns:
-        Same shapes/dtypes tuple as ``engram_gate_ref`` when ``save_for_backward=True``; else ``output``.
-    """
-    hidden_size = hidden_states.shape[-1]
-    num_tokens, hc_mult, hidden_size_ = hidden_states.shape
-    assert hidden_size_ == hidden_size
-    blk_d = _choose_engram_fwd_blk_d(hidden_size)
-    threads, vec_size = _choose_engram_fwd_threads_vec_size(blk_d)
-    reduce_blk = threads * vec_size
-    num_blk = hidden_size // blk_d
-    sub_blks = blk_d // reduce_blk
-    assert blk_d % reduce_blk == 0
-
-    # Visit order matching kernel: chunks (i_b-1) for i_b=1..num_blk-1, then last chunk epilogue.
-    sub_bases: list[int] = []
-    for i_b in range(1, num_blk):
-        base_chunk = (i_b - 1) * blk_d
-        for i_sub in range(sub_blks):
-            sub_bases.append(base_chunk + i_sub * reduce_blk)
-    last_chunk_base = (num_blk - 1) * blk_d
-    for i_sub in range(sub_blks):
-        sub_bases.append(last_chunk_base + i_sub * reduce_blk)
-    assert len(sub_bases) * reduce_blk == hidden_size
-
-    scalar = hidden_size ** -0.5
-    device = hidden_states.device
-    bf16 = hidden_states.dtype
-    dtype = torch.float32
-
-    x_bf = hidden_states.to(dtype)
-    k_bf = k.to(dtype)
-    v_bf = v.to(dtype).unsqueeze(1)
-    wf = weight_fused.to(dtype)
-    wf = wf.unsqueeze(0).expand(num_tokens, hc_mult, hidden_size)
-
-    # Flatten (num_tokens * hc_mult) independent rows × hidden.
-    bat = num_tokens * hc_mult
-    x2 = x_bf.reshape(bat, hidden_size)
-    k2 = k_bf.reshape(bat, hidden_size)
-    w2 = wf.reshape(bat, hidden_size)
-
-    lane_x2 = torch.zeros((bat, threads), dtype=dtype, device=device)
-    lane_k2 = torch.zeros((bat, threads), dtype=dtype, device=device)
-    lane_g = torch.zeros((bat, threads), dtype=dtype, device=device)
-
-    for sb in sub_bases:
-        x_blk = x2[:, sb : sb + reduce_blk].reshape(bat, threads, vec_size)
-        k_blk = k2[:, sb : sb + reduce_blk].reshape(bat, threads, vec_size)
-        w_blk = w2[:, sb : sb + reduce_blk].reshape(bat, threads, vec_size)
-        for i_k in range(vec_size):
-            xv = x_blk[:, :, i_k]
-            kv = k_blk[:, :, i_k]
-            wv = w_blk[:, :, i_k]
-            lane_x2 = lane_x2 + xv * xv
-            lane_k2 = lane_k2 + kv * kv
-            lane_g = lane_g + xv * wv * kv
-
-    acc_x = lane_x2[:, 0].clone()
-    acc_k = lane_k2[:, 0].clone()
-    acc_dot = lane_g[:, 0].clone()
-    for lane in range(1, threads):
-        acc_x = acc_x + lane_x2[:, lane]
-        acc_k = acc_k + lane_k2[:, lane]
-        acc_dot = acc_dot + lane_g[:, lane]
-
-    sum_x2 = acc_x.reshape(num_tokens, hc_mult)
-    sum_k2 = acc_k.reshape(num_tokens, hc_mult)
-    raw_dot = acc_dot.reshape(num_tokens, hc_mult)
-
-    rstd_x = torch.rsqrt(sum_x2 / hidden_size + eps)
-    rstd_k = torch.rsqrt(sum_k2 / hidden_size + eps)
-
-    scaled = raw_dot * rstd_x * rstd_k * scalar
-    mag = scaled.abs().clamp(min=clamp_value).sqrt()
-    gate_score = (mag * scaled.sign()).sigmoid()
-
-    out_f = x_bf + gate_score.unsqueeze(-1) * v_bf.to(dtype)
-    output = out_f.to(bf16)
+    if image_token_mask is not None:
+        output = torch.where(image_token_mask[..., None, None], hidden_states, output)
 
     if save_for_backward:
         return output, raw_dot, gate_score, rstd_x, rstd_k
