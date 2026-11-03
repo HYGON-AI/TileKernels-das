@@ -47,6 +47,7 @@ for `tilelang-hygon` at `9f3bbcd37e0955dfd1360501c95c48095d9f9bf8`.
 It fixes FP4/FP8 packing, numeric conversions, padding, narrow-integer bit reinterpretation,
 wide vector index generation, exact floating-point literal emission, and BF16/FP8/FP4 stochastic rounding. It includes seventeen compiler regression cases and excludes unrelated distributed changes.
 The [HCU integration review](patches/hcu-integration-review.json) records the kernel changes and validation scope.
+The main integration was validated on one gfx936 GPU with `TK_TEST_LEVEL=0`: 2,938 correctness cases and 17 compiler regressions passed. The runtime used Python 3.10.12 and PyTorch 2.11.0 (HIP 6.3); other hardware and test levels were not covered by this run.
 For an unpatched TileLang checkout:
 
 ```bash
@@ -117,7 +118,7 @@ This repository is based on the following upstream integration baseline:
 - Upstream project: TileKernels
 - Upstream repository: https://github.com/deepseek-ai/TileKernels
 - Upstream branch: `main`
-- Upstream Commit: [`828cc15d17e2ef4b351c2cb6021de02fde82330e`](https://github.com/deepseek-ai/TileKernels/commit/828cc15d17e2ef4b351c2cb6021de02fde82330e)
+- Upstream Commit: [`c1cf914a82e6901c679445f872051ce44ac2cc63`](https://github.com/deepseek-ai/TileKernels/commit/c1cf914a82e6901c679445f872051ce44ac2cc63)
 - Upstream license: [MIT License](https://github.com/deepseek-ai/TileKernels/blob/main/LICENSE)
 
 Hygon adaptations, modifications, and original contributions are licensed under the MIT License.

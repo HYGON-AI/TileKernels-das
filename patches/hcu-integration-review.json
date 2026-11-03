@@ -11,7 +11,8 @@
     "python": "3.10.12",
     "torch": "2.11.0 HIP 6.3",
     "tilelang_base": "9f3bbcd37e0955dfd1360501c95c48095d9f9bf8",
-    "test_level": 0
+    "test_level": 0,
+    "tilelang_checkout_head": "6eea7c2e0d52a4294c8fa3b7f4b2b1f0f6a21659"
   },
   "compiler_patch": {
     "path": "patches/tilelang-hcu-low-precision-codegen.patch",
@@ -101,7 +102,9 @@
     "swiglu_backward_cases_passed": 4,
     "swiglu_forward_cases_bitwise_equal": 4,
     "high_repeat_sinkhorn_cases_bitwise_equal": 8,
-    "benchmark_smoke": "eager and graph CLI passed without graph fallback; profiler recorded fused kernel"
+    "benchmark_smoke": "eager and graph CLI passed without graph fallback; profiler recorded fused kernel",
+    "main_norm_vs_v2_bitwise_cases": 8,
+    "main_swiglu_forward_vs_DAS_bitwise_cases": 4
   },
   "validation": {
     "v2_0_recorded_coverage": {
@@ -110,10 +113,71 @@
       "missing_passing_records": 0,
       "benchmark_cases_not_run": 2680
     },
-    "status": "v2.0 scope covered; main merge and final fresh-cache sweep pending"
+    "status": "Complete: 35 files, 2938 correctness cases and 17 compiler regressions passed on GPU 0; 24 critical same-input output sets bitwise equal to original DAS",
+    "main_affected_fresh_cache": {
+      "passed": 239,
+      "skipped": 200,
+      "failures": 0
+    },
+    "main_compiler_regressions": {
+      "passed": 17,
+      "cache_disabled": true,
+      "clean_pinned_base_apply_check": true,
+      "reverse_source_check": true
+    },
+    "main_final_coverage": {
+      "files": 35,
+      "correctness_cases": 2938,
+      "failures": 0,
+      "missing_passing_records": 0,
+      "source_fingerprints_verified": true,
+      "benchmark_cases_not_run": 2680
+    }
   },
   "default_scope": {
     "TK_TEST_LEVEL": 0,
     "very_large_6_44G_element_cast_cases": "explicit level2 only, per user instruction"
+  },
+  "main_merge_review": {
+    "target": "c1cf914a82e6901c679445f872051ce44ac2cc63",
+    "text_conflicts": [
+      "tests/engram/test_engram_gate_bwd.py"
+    ],
+    "resolution": "retain FP32 gradient reference, output dtype assertions and stricter v2.0 tolerances",
+    "coverage_preserved": [
+      "norm out_scale=0.3",
+      "norm row padding0/16",
+      "extended zero out-gradient cases"
+    ],
+    "upstream_updates": [
+      "Engram CUDA grad-output vector width aligned with input vector width; HCU retains original DAS reduction grouping",
+      "optional norm with_rstd API",
+      "SwiGLU split 64-bit counter reduction",
+      "FP4 torch reference implementation"
+    ],
+    "final_fresh_cache": "/tmp/tk-main-final-cache",
+    "engram_hcu_layout": {
+      "status": "Selected: retain original DAS HCU8/4 grouping; CUDA retains upstream vec4",
+      "reason": "User requested separate review of kernel-internal changes and preservation of pre-merge results",
+      "upstream_vec4": {
+        "full_backward_cases_passed": 28,
+        "critical_output_sets_bitwise_equal": 21,
+        "critical_output_sets_within_original_tolerances": 24,
+        "normal4096_max_abs": {
+          "grad_x": 0.015625,
+          "grad_k": 0.0078125,
+          "grad_w_partial": 1.1444091796875e-05
+        }
+      },
+      "DAS_HCU_grouping_candidate": {
+        "preserves_upstream_CUDA_vec4": true,
+        "normal4096_all_four_outputs_bitwise_equal_to_DAS": true,
+        "backward_cases_passed": 28,
+        "inner_kernel_AST_unchanged_from_v2": true
+      },
+      "decision_basis": "Existing user objective explicitly requires preservation of pre-merge results; independent review confirms unchanged kernel formulas, bitwise DAS agreement and full backward correctness. No approval is inferred from elapsed time.",
+      "production_backward_cases_passed": 28,
+      "final_critical_output_sets_bitwise_equal_to_DAS": 24
+    }
   }
 }
