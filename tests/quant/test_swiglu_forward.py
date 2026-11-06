@@ -17,7 +17,7 @@ from tile_kernels.testing.generator import (
 )
 from tile_kernels.testing.numeric import assert_equal, count_bytes
 from tile_kernels.testing.bench import make_param_id, get_cast_params
-from tile_kernels.config import is_ascend, get_device, is_hcu
+from tile_kernels.config import is_ascend, get_device, get_device_num_sms, is_hcu
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
@@ -205,11 +205,23 @@ def test_swiglu_forward_and_per_token_cast_benchmark(benchmark_timer, benchmark_
 
 @pytest.mark.skipif(not is_hcu(),reason='HCU wave-size and persistent-loop regression')
 @pytest.mark.parametrize('hidden',[64,192,3584])
-@pytest.mark.parametrize('num_sms',[1,80])
+@pytest.mark.parametrize(
+    'num_sms',
+    [
+        pytest.param(
+            num_sms,
+            marks=pytest.mark.skipif(
+                is_hcu() and num_sms > get_device_num_sms(),
+                reason=f'Requires at least {num_sms} CUs',
+            ),
+        )
+        for num_sms in (1, 64, 72, 80)
+    ],
+)
 @pytest.mark.parametrize('fmt',['fp32','e4m3'])
 def test_hcu_swiglu_forward_boundaries(hidden,num_sms,fmt):
     torch.manual_seed(96513)
-    tokens=3 if num_sms==1 else 81
+    tokens=3 if num_sms==1 else num_sms+1
     tile_kernels.set_num_sms(num_sms)
     x=torch.randn(tokens,hidden*2,device=get_device(),dtype=torch.bfloat16)
     weights=torch.rand(tokens,device=x.device) if fmt=='e4m3' else None
